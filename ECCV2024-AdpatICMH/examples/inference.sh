@@ -1,0 +1,1 @@
+python examples/moe_run.py -c LOG_PATH/moe/6.0/4/configs/config_runtime.yaml -T

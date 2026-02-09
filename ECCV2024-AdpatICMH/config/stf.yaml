@@ -1,0 +1,51 @@
+exp_name: "moecodec_cvpr"
+model: "stf"
+seed: 42
+fastrcnn_path: "./codec_ckpt/model_final_280758.pkl"
+maskrcnn_path: "./codec_ckpt/model_final_f10217.pkl"
+cuda: True
+gpu_id: 2
+save: True
+root: "./LOG_PATH"
+checkpoint: "LOG_PATH/moecodec_cvpr/5.0/2/checkpoint_5.pth.tar"
+resume: True
+
+#optimizer
+epochs: 20
+warmup_epochs: 3
+milestones: [5,10,15]
+learning_rate: 1.e-4
+aux_learning_rate: 1.e-3
+clip_max_norm: 1.0
+
+#dataset
+dataset: "imagenet"
+dataset_path: '/home/zjc/data'
+data_length: 200000
+batch_size: 20
+test_batch_size: 20
+num_workers: 16
+patch_size: 256
+init_prob:
+  cls: 0.4
+  det: 0.3
+  seg: 0.3
+
+#moe
+enc_moe: True
+dec_moe: True
+moe_config:
+  num_experts: 2
+  capacity: 1.0
+  n_shared_experts: 0
+
+#task
+tasks: ['cls', 'det', 'seg']
+lmbda:
+  task: 5.0 #{1.8 ,3.5, 6.7, 13}
+  cls: 1.0 #0.03
+  det: 0.2 #0.1
+  seg: 0.1 #0.2
+
+#task prompt
+prompt_mode: pr

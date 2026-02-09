@@ -1,0 +1,21 @@
+root: "LOG_PATH"
+exp_name: "exp"
+model: "tic_sfma"
+dataset: "PASCAL_VOC"
+dataset_path: "data/VOCdevkit"
+fastrcnn_path: "./codec_ckpt/model_final_280758.pkl"
+checkpoint: "./codec_ckpt/ckpt_det_level4.tar"
+epochs: 40
+learning_rate: 1.e-4
+gpu_id: 2
+quality_level: 4 # {1,2,3,4}
+task_lmbda: 5 # {0.5, 1, 2, 5}
+num_workers: 16
+batch_size: 8
+test_batch_size: 1
+aux_learning_rate: 1.e-3
+patch_size: 256
+cuda: True
+save: True
+clip_max_norm: 1.0
+seed: 42

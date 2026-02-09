@@ -1,0 +1,70 @@
+exp_name: "bitallocation_e4"
+model: "moecodec"
+seed: 42
+fastrcnn_path: "./codec_ckpt/model_final_280758.pkl"
+maskrcnn_path: "./codec_ckpt/model_final_f10217.pkl"
+cuda: True
+gpu_id: 2
+save: True
+root: "./LOG_PATH_VIS"
+checkpoint: "LOG_PATH/moe_cvpr/5.0/4/checkpoint_19.pth.tar"
+resume: True
+
+#optimizer
+epochs: 20
+warmup_epochs: 5
+learning_rate: 1.e-4
+aux_learning_rate: 1.e-3
+clip_max_norm: 1.0
+
+#dataset
+dataset: "imagenet"
+dataset_path: '/home/zjc/data'
+data_length: 200000
+batch_size: 16
+test_batch_size: 1
+num_workers: 16
+patch_size: 256
+init_prob:
+  cls: 0.4
+  det: 0.3
+  seg: 0.3
+
+#moe
+enc_moe: True
+dec_moe: True
+moe_config:
+  num_experts: 4
+  capacity: 1
+  n_shared_experts: 0
+
+#task
+tasks: ['cls', 'det', 'seg']
+lmbda:
+  task: 5.0 #{1.8 ,3.5, 6.7, 13}
+  cls: 1.0
+  det: 0.2
+  seg: 0.1
+
+#task prompt
+prompt_mode: pr
+
+
+
+# transtic 
+LOCATION: 'prepend'
+DEEP: True
+NUM_TOKENS: 16
+INITIATION: 'random'
+PROJECT: -1
+DROPOUT: 0.
+TRANSFER_TYPE: 'prompt'
+ARCHITECT: 'both'
+VPT_lmbda: 2 # {2, 1, 0.5, 0.2}
+WINDOW: 'same'
+HYPERPRIOR: False
+RETURN_ATTENTION: False
+MODEL_DECODER: False
+MASK_DOWNSAMPLE: 2
+DECODER_BLOCK: [1,2,3,4]
+mid_dim: 32

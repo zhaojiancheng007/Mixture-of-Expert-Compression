@@ -1,0 +1,39 @@
+model: "tic_sfma"
+dataset: "imagenet"
+dataset_path: '/home/zjc/data/imagenet-1k'
+epochs: 120
+learning_rate: 1.e-4
+num_workers: 16
+quality_level: 4 # {1,2,3,4}
+task_lmbda: 13 #{1.8 ,3.5, 6.7, 13}
+batch_size: 16
+test_batch_size: 32
+aux_learning_rate: 1.e-3
+patch_size: 256
+cuda: True
+gpu_id: 0
+save: True
+clip_max_norm: 1.0
+name: "exp"
+exp_name: "exp"
+root: "./LOG_PATH"
+seed: 42
+checkpoint: "/home/zjc/All-in-One-Compression/ckpt/base_codec_4.pth.tar"
+
+# transtic 
+LOCATION: 'prepend'
+DEEP: True
+NUM_TOKENS: 16
+INITIATION: 'random'
+PROJECT: -1
+DROPOUT: 0.
+TRANSFER_TYPE: 'prompt'
+ARCHITECT: 'both'
+VPT_lmbda: 2 # {2, 1, 0.5, 0.2}
+WINDOW: 'same'
+HYPERPRIOR: False
+RETURN_ATTENTION: False
+MODEL_DECODER: False
+MASK_DOWNSAMPLE: 2
+DECODER_BLOCK: [1,2,3,4]
+mid_dim: 32
