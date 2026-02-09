@@ -557,14 +557,25 @@ class SwinTransformerBlock(nn.Module):
         # self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
         self.use_moe = use_moe
         if use_moe:
-            self.moe_mlp = SparseMoEBlock(
-                experts=[Mlp(in_features=dim, hidden_features=mlp_hidden_dim // moe_config['hid_ratio'], act_layer=act_layer, drop=drop) for _ in range(moe_config['num_experts'])],
-                hidden_dim=dim,
-                num_experts=moe_config['num_experts'],
-                capacity=moe_config['capacity'],
-                n_shared_experts=moe_config['n_shared_experts'],
-                use_prompt = use_prompt
-                    )
+            moe_type = moe_config.get('moe_type', 'spatial')
+            if moe_type == 'channel':
+                self.moe_mlp = ChannelMoEBlock(
+                    hidden_dim=dim,
+                    num_groups=moe_config.get('num_groups', moe_config['num_experts']),
+                    num_experts=moe_config['num_experts'],
+                    capacity=moe_config['capacity'],
+                    hid_ratio=moe_config.get('hid_ratio', 1),
+                    n_shared_experts=moe_config['n_shared_experts'],
+                )
+            else:
+                self.moe_mlp = SparseMoEBlock(
+                    experts=[Mlp(in_features=dim, hidden_features=mlp_hidden_dim // moe_config['hid_ratio'], act_layer=act_layer, drop=drop) for _ in range(moe_config['num_experts'])],
+                    hidden_dim=dim,
+                    num_experts=moe_config['num_experts'],
+                    capacity=moe_config['capacity'],
+                    n_shared_experts=moe_config['n_shared_experts'],
+                    use_prompt = use_prompt
+                        )
         else:
             self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
            
@@ -891,6 +902,125 @@ class SparseMoEBlock(nn.Module):
             x_out = x_out + self.shared_experts(identity)
 
         return x_out
+
+
+class ChannelMoEBlock(nn.Module):
+    """Channel-wise sparse MoE block.
+
+    Instead of routing over spatial tokens (as ``SparseMoEBlock`` does),
+    this block divides the channel dimension into ``num_groups`` groups
+    ("channel tokens"), computes a global (spatial-averaged) routing signal,
+    and dispatches channel groups to experts via expert-choice top-k routing.
+
+    Each expert is a lightweight MLP that operates on ``C_group``-dimensional
+    features (per spatial position, per channel group).
+    """
+
+    def __init__(self, hidden_dim, num_groups, num_experts,
+                 capacity=2, hid_ratio=1, n_shared_experts=0):
+        """
+        Args:
+            hidden_dim: total channel dimension C.
+            num_groups: G – number of channel groups (must divide hidden_dim).
+            num_experts: E – number of routed experts.
+            capacity: multiplier for top-k; k = (G / E) * capacity.
+            hid_ratio: expert hidden dim = group_dim * 4 // hid_ratio.
+            n_shared_experts: number of shared experts (0 = none).
+        """
+        super().__init__()
+        assert hidden_dim % num_groups == 0, (
+            f"hidden_dim ({hidden_dim}) must be divisible by num_groups ({num_groups})"
+        )
+        self.hidden_dim = hidden_dim
+        self.num_groups = num_groups
+        self.group_dim = hidden_dim // num_groups   # C_group
+        self.num_experts = num_experts
+        self.capacity = capacity
+
+        # Gate: route channel groups to experts based on group features
+        self.gate_weight = nn.Parameter(torch.empty(self.group_dim, num_experts))
+        nn.init.normal_(self.gate_weight, std=0.006)
+
+        # Experts: each maps C_group -> hidden -> C_group
+        expert_hidden = max(1, self.group_dim * 4 // hid_ratio)
+        self.experts = nn.ModuleList([
+            Mlp(in_features=self.group_dim,
+                hidden_features=expert_hidden,
+                out_features=self.group_dim)
+            for _ in range(num_experts)
+        ])
+
+        # Optional shared experts (operate per-group as well)
+        self.n_shared_experts = n_shared_experts
+        if n_shared_experts > 0:
+            self.shared_experts = MoeMLP(
+                hidden_size=self.group_dim,
+                intermediate_size=self.group_dim * n_shared_experts,
+                pretraining_tp=1,          # group_dim is small, no need for TP
+            )
+
+    def forward(self, x, prompt=None):
+        """
+        Args:
+            x: (B, S, C) where S = H*W, C = hidden_dim.
+        Returns:
+            (B, S, C) – same shape as input.
+        """
+        B, S, C = x.shape
+        G  = self.num_groups
+        Cg = self.group_dim
+
+        # ---- 1. channel grouping ----
+        # (B, S, C) -> (B, S, G, Cg)
+        x_grouped = x.reshape(B, S, G, Cg)
+        identity_grouped = x_grouped
+
+        # ---- 2. global routing signal (spatial avg-pool) ----
+        # (B, S, G, Cg) -> mean over S -> (B, G, Cg)
+        x_pool = x_grouped.mean(dim=1)
+
+        # ---- 3. gate logits & affinity ----
+        # (B, G, Cg) @ (Cg, E) -> (B, G, E)
+        logits = x_pool @ self.gate_weight
+        affinity = torch.softmax(logits, dim=-1)   # (B, G, E)
+
+        # ---- 4. expert-choice top-k ----
+        affinity_T = affinity.permute(0, 2, 1)     # (B, E, G)
+        k = max(1, int((G / self.num_experts) * self.capacity))
+        gating, index = torch.topk(affinity_T, k=k, dim=-1)  # (B, E, k)
+
+        # ---- 5. expert forward ----
+        x_out_grouped = torch.zeros_like(x_grouped)  # (B, S, G, Cg)
+
+        for e in range(self.num_experts):
+            idx = index[:, e, :]                      # (B, k)
+            wt  = gating[:, e, :]                     # (B, k)
+
+            # gather channel groups across all spatial positions
+            # idx_exp: (B, S, k, Cg)
+            idx_exp = idx[:, None, :, None].expand(B, S, k, Cg)
+            x_sel = torch.gather(x_grouped, 2, idx_exp)   # (B, S, k, Cg)
+
+            # expert MLP: (B*S, k, Cg) -> (B*S, k, Cg)
+            x_flat = x_sel.reshape(B * S, k, Cg)
+            x_proc = self.experts[e](x_flat)
+            x_proc = x_proc.reshape(B, S, k, Cg)
+
+            # weight by gating score
+            wt_exp = wt[:, None, :, None]              # (B, 1, k, 1)
+            contrib = x_proc * wt_exp
+
+            # scatter back
+            x_out_grouped.scatter_add_(2, idx_exp, contrib)
+
+        # ---- 6. shared experts (per-group) ----
+        if self.n_shared_experts > 0:
+            id_flat = identity_grouped.reshape(B * S, G, Cg)
+            shared_out = self.shared_experts(id_flat)      # (B*S, G, Cg)
+            x_out_grouped = x_out_grouped + shared_out.reshape(B, S, G, Cg)
+
+        # ---- 7. reshape back ----
+        return x_out_grouped.reshape(B, S, C)
 
 
 # class SparseMoEBlock(nn.Module):

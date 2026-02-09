@@ -46,7 +46,7 @@ from .layers_tinylic import (
     MultistageMaskedConv2d,
     Mlp,
 )
-from .moe_layers import SparseMoEBlock
+from .moe_layers import SparseMoEBlock, ChannelMoEBlock
 
 
 __all__ = [
@@ -86,19 +86,30 @@ class NSABlock(nn.Module):
         mlp_hidden_dim = int(dim * mlp_ratio)
 
         if use_moe and moe_config is not None:
-            self.moe_mlp = SparseMoEBlock(
-                experts=[
-                    Mlp(in_features=dim,
-                        hidden_features=mlp_hidden_dim // moe_config['hid_ratio'],
-                        act_layer=act_layer, drop=drop)
-                    for _ in range(moe_config['num_experts'])
-                ],
-                hidden_dim=dim,
-                num_experts=moe_config['num_experts'],
-                capacity=moe_config['capacity'],
-                n_shared_experts=moe_config['n_shared_experts'],
-                use_prompt=False,
-            )
+            moe_type = moe_config.get('moe_type', 'spatial')
+            if moe_type == 'channel':
+                self.moe_mlp = ChannelMoEBlock(
+                    hidden_dim=dim,
+                    num_groups=moe_config.get('num_groups', moe_config['num_experts']),
+                    num_experts=moe_config['num_experts'],
+                    capacity=moe_config['capacity'],
+                    hid_ratio=moe_config.get('hid_ratio', 1),
+                    n_shared_experts=moe_config['n_shared_experts'],
+                )
+            else:
+                self.moe_mlp = SparseMoEBlock(
+                    experts=[
+                        Mlp(in_features=dim,
+                            hidden_features=mlp_hidden_dim // moe_config['hid_ratio'],
+                            act_layer=act_layer, drop=drop)
+                        for _ in range(moe_config['num_experts'])
+                    ],
+                    hidden_dim=dim,
+                    num_experts=moe_config['num_experts'],
+                    capacity=moe_config['capacity'],
+                    n_shared_experts=moe_config['n_shared_experts'],
+                    use_prompt=False,
+                )
         else:
             self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim,
                            act_layer=act_layer, drop=drop)

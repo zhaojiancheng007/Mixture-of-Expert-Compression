@@ -1,1 +1,1 @@
-CUDA_VISIBLE_DEVICES=0 nohup python examples/moecodec_psnr.py -c config/moe_st_psnr.yaml >moecodecTinyLIC_lmbda1e2.log
+CUDA_VISIBLE_DEVICES=2 nohup python examples/moecodec_psnr.py -c config/moe_st_psnr.yaml >moecodecTinyLIC_lmbda5e3.log

@@ -29,7 +29,7 @@ M: 320
 # Z: 192     # 超先验瓶颈通道数 (仅 TCM/TCM_MoE 使用)
 
 # RD loss, mse系数
-lmbda: 1e-2
+lmbda: 5e-3
 distortion: mse
 
 # 优化器
@@ -50,7 +50,15 @@ TEST: False
 #moe
 enc_moe: True
 dec_moe: True
+h_moe: True
 moe_config:
+  # moe_type: "spatial" (默认, 对空间位置路由) 或 "channel" (对通道组路由)
+  moe_type: channel
+  # num_groups: 通道组数 (仅 channel MoE 使用), 必须整除所有 MoE 层的通道数
+  #   TIC/TIC_MoE: 需整除 128, 192 → 可选 4, 8, 16, 32, 64
+  #   TinyLIC/TinyLIC_MoE: 需整除 128, 192, 256, 320 → 可选 4, 8, 16, 32, 64
+  #   TCM/TCM_MoE: 需整除 128, 320 → 可选 4, 8, 16, 32, 64
+  num_groups: 8
   num_experts: 4
   capacity: 1.0
   n_shared_experts: 0
