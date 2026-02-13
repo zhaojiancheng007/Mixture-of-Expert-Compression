@@ -567,6 +567,17 @@ class SwinTransformerBlock(nn.Module):
                     hid_ratio=moe_config.get('hid_ratio', 1),
                     n_shared_experts=moe_config['n_shared_experts'],
                 )
+            elif moe_type == 'patch':
+                _ps = moe_config.get('patch_size', 4)
+                self.moe_mlp = PatchMoEBlock(
+                    experts=[Mlp(in_features=dim, hidden_features=mlp_hidden_dim // moe_config['hid_ratio'], act_layer=act_layer, drop=drop) for _ in range(moe_config['num_experts'])],
+                    hidden_dim=dim,
+                    num_experts=moe_config['num_experts'],
+                    capacity=moe_config['capacity'],
+                    n_shared_experts=moe_config['n_shared_experts'],
+                    use_prompt=use_prompt,
+                    patch_size=_ps,
+                )
             else:
                 self.moe_mlp = SparseMoEBlock(
                     experts=[Mlp(in_features=dim, hidden_features=mlp_hidden_dim // moe_config['hid_ratio'], act_layer=act_layer, drop=drop) for _ in range(moe_config['num_experts'])],
@@ -574,7 +585,8 @@ class SwinTransformerBlock(nn.Module):
                     num_experts=moe_config['num_experts'],
                     capacity=moe_config['capacity'],
                     n_shared_experts=moe_config['n_shared_experts'],
-                    use_prompt = use_prompt
+                    use_prompt=use_prompt,
+                    mix_batch_token=moe_config.get('mix_batch_token', False),
                         )
         else:
             self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
@@ -649,7 +661,12 @@ class SwinTransformerBlock(nn.Module):
         # FFN
         x = shortcut + self.drop_path(x)
         if self.use_moe:
-            x = x + self.drop_path(self.moe_mlp(self.norm2(x),prompt))
+            if isinstance(self.moe_mlp, PatchMoEBlock):
+                x = x + self.drop_path(self.moe_mlp(self.norm2(x), prompt, x_size=x_size))
+            elif isinstance(self.moe_mlp, SparseMoEBlock):
+                x = x + self.drop_path(self.moe_mlp(self.norm2(x), prompt, x_size=x_size))
+            else:
+                x = x + self.drop_path(self.moe_mlp(self.norm2(x), prompt))
         else:
             x = x + self.drop_path(self.mlp(self.norm2(x)))
 
@@ -836,14 +853,22 @@ class MoeMLP(nn.Module):
 
 class SparseMoEBlock(nn.Module):
     """
-    A sparse MoE block with optional shared experts.
+    A sparse MoE block with optional shared experts (spatial / pixel-level routing).
+
+    Each forward pass records ``_last_select_count`` (how many experts chose
+    each spatial token) and ``_last_grid_size`` (H, W) for heatmap visualisation.
     """
-    def __init__(self, experts, hidden_dim, num_experts, n_shared_experts=0, capacity=2, use_prompt=False, prompt_mod='add'):
+    def __init__(self, experts, hidden_dim, num_experts, n_shared_experts=0, capacity=2,
+                 use_prompt=False, prompt_mod='add', mix_batch_token=False):
         super().__init__()
         self.experts = nn.ModuleList(experts)
         self.capacity = capacity
         self.num_experts = num_experts
-        
+        self.hidden_dim = hidden_dim
+        self.use_prompt = use_prompt
+        self.prompt_mod = prompt_mod
+        self.mix_batch_token = bool(mix_batch_token)
+
         self.gate_weight = nn.Parameter(torch.empty((hidden_dim, num_experts)))
         nn.init.normal_(self.gate_weight, std=0.006)
 
@@ -856,47 +881,161 @@ class SparseMoEBlock(nn.Module):
                 pretraining_tp=2
             )
 
-    def forward(self, x, prompt=None):
+        # Populated every forward for vis
+        self._last_select_count = None   # (B, S)
+        self._last_grid_size = None      # (H, W)
+        self._last_gate_mass = None      # (B, S)
+        self._last_index = None          # (B, E, k)
+        self._last_gating = None         # (B, E, k)
+        self._last_token_energy = None   # (B, S)
+        self._last_smooth_loss = None    # scalar, differentiable when training
+
+    @staticmethod
+    def _factorize_hw(S):
+        H = W = int(math.sqrt(S))
+        if H * W == S:
+            return H, W
+        for h in range(int(math.sqrt(S)), 0, -1):
+            if S % h == 0:
+                return h, S // h
+        return S, 1
+
+    def _infer_hw(self, S, x_size=None):
+        if x_size is not None and len(x_size) == 2:
+            H, W = int(x_size[0]), int(x_size[1])
+            if H > 0 and W > 0 and H * W == S:
+                return H, W
+        return self._factorize_hw(S)
+
+    @staticmethod
+    def _tv_l1(prob_map):
+        """
+        Total variation (anisotropic): ||dx||_1 + ||dy||_1 on (B, E, H, W).
+        """
+        loss = prob_map.new_zeros(())
+        if prob_map.size(-2) > 1:
+            loss = loss + (prob_map[:, :, 1:, :] - prob_map[:, :, :-1, :]).abs().mean()
+        if prob_map.size(-1) > 1:
+            loss = loss + (prob_map[:, :, :, 1:] - prob_map[:, :, :, :-1]).abs().mean()
+        return loss
+
+    def _prob_smooth_loss(self, affinity, hw):
+        """
+        affinity: (B, S, E) softmax probabilities over experts.
+        hw: (H, W) for reshaping token sequence into a spatial map.
+        """
+        B, S, E = affinity.shape
+        H, W = hw
+        if H * W != S:
+            return affinity.new_zeros(())
+        prob_map = affinity.permute(0, 2, 1).reshape(B, E, H, W)
+        return self._tv_l1(prob_map)
+
+    def forward(self, x, prompt=None, x_size=None):
         """
         x: (B, S, D)  batch_size, seq_len, hidden_dim
+        x_size: optional (H, W) for vis; inferred from S if absent.
         """
         identity = x
         B, S, D = x.shape
 
-        # === affinity matrix ===
-        logits = x @ self.gate_weight  
-        affinity = torch.softmax(logits, dim=-1) 
+        self._last_grid_size = self._infer_hw(S, x_size=x_size)
+        self._last_token_energy = (x.pow(2).mean(dim=-1)).detach()  # (B, S)
+        self._last_smooth_loss = x.new_zeros(())
 
-        # --> (B, E, S)
-        affinity_T = affinity.permute(0, 2, 1)  # (B, E, S)
+        if self.mix_batch_token:
+            # Optional global routing across all tokens in the batch.
+            # Pool size becomes (B * S), so experts can allocate compute
+            # to high-value tokens regardless of which sample they come from.
+            x_flat = x.reshape(B * S, D)  # (BS, D)
+            logits = x_flat @ self.gate_weight  # (BS, E)
+            affinity = torch.softmax(logits, dim=-1)
+            if self.training:
+                affinity_bse = affinity.reshape(B, S, self.num_experts)
+                self._last_smooth_loss = self._prob_smooth_loss(
+                    affinity_bse, self._last_grid_size
+                )
+            affinity_T = affinity.transpose(0, 1)  # (E, BS)
 
-        # === 计算 top-k 路由 ===
-        k = max(1, int((S / self.num_experts) * self.capacity))
-        gating, index = torch.topk(affinity_T, k=k, dim=-1)  # (B, E, k)
+            k = max(1, int(((B * S) / self.num_experts) * self.capacity))
+            gating, index = torch.topk(affinity_T, k=k, dim=-1)  # (E, k)
 
-        # === expert forward ===
-        x_in = []
-        for e in range(self.num_experts):
-            # 取 expert e 选中的 token 索引 (B, k)
-            idx = index[:, e, :]  # (B, k)
-            # gather tokens (B, k, D)
-            x_selected = torch.gather(x, 1, idx.unsqueeze(-1).expand(-1, -1, D))
-            x_in.append(x_selected)
-        
-        x_e = []
-        for e in range(self.num_experts):
-            out = self.experts[e](x_in[e])   # (B, k, D)
-            x_e.append(out)
-        x_e = torch.stack(x_e, dim=1)  # (B, E, k, D)
+            select_count_flat = torch.zeros(B * S, device=x.device)
+            for e in range(self.num_experts):
+                select_count_flat.scatter_add_(
+                    0, index[e], torch.ones_like(gating[e])
+                )
+            self._last_select_count = select_count_flat.reshape(B, S).detach()
 
-        # === concat --> (B, S, D) ===
-        x_out = torch.zeros_like(x)
-        for e in range(self.num_experts):
-            idx = index[:, e, :]  # (B, k)
-            weight = gating[:, e, :].unsqueeze(-1)  # (B, k, 1)
-            contrib = x_e[:, e, :, :] * weight      # (B, k, D)
+            gate_mass_flat = torch.zeros(B * S, device=x.device, dtype=gating.dtype)
+            for e in range(self.num_experts):
+                gate_mass_flat.scatter_add_(0, index[e], gating[e])
+            self._last_gate_mass = gate_mass_flat.reshape(B, S).detach()
 
-            x_out = x_out.scatter_add(1, idx.unsqueeze(-1).expand(-1, -1, D), contrib)
+            # Keep vis-safe: existing expert-specialization code expects (B,E,k).
+            self._last_index = None
+            self._last_gating = None
+
+            x_out_flat = torch.zeros_like(x_flat)
+            for e in range(self.num_experts):
+                idx = index[e]                     # (k,)
+                x_selected = x_flat.index_select(0, idx)  # (k, D)
+                out = self.experts[e](x_selected)         # (k, D)
+                contrib = out * gating[e].unsqueeze(-1)   # (k, D)
+                x_out_flat.index_add_(0, idx, contrib)
+
+            x_out = x_out_flat.reshape(B, S, D)
+        else:
+            # === router logits ===
+            logits = x @ self.gate_weight
+            affinity = torch.softmax(logits, dim=-1)
+            if self.training:
+                self._last_smooth_loss = self._prob_smooth_loss(
+                    affinity, self._last_grid_size
+                )
+
+            # --> (B, E, S)
+            affinity_T = affinity.permute(0, 2, 1)  # (B, E, S)
+
+            # === top-k routing ===
+            k = max(1, int((S / self.num_experts) * self.capacity))
+            gating, index = torch.topk(affinity_T, k=k, dim=-1)  # (B, E, k)
+
+            # === record per-token selection count for vis ===
+            select_count = torch.zeros(B, S, device=x.device)
+            for e in range(self.num_experts):
+                ones = torch.ones_like(gating[:, e, :])   # (B, k)
+                select_count.scatter_add_(1, index[:, e, :], ones)
+            self._last_select_count = select_count.detach()  # (B, S)
+
+            gate_mass = torch.zeros(B, S, device=x.device, dtype=gating.dtype)
+            for e in range(self.num_experts):
+                gate_mass.scatter_add_(1, index[:, e, :], gating[:, e, :])
+            self._last_gate_mass = gate_mass.detach()  # (B, S)
+
+            self._last_index = index.detach()
+            self._last_gating = gating.detach()
+
+            # === expert forward ===
+            x_in = []
+            for e in range(self.num_experts):
+                idx = index[:, e, :]  # (B, k)
+                x_selected = torch.gather(x, 1, idx.unsqueeze(-1).expand(-1, -1, D))
+                x_in.append(x_selected)
+
+            x_e = []
+            for e in range(self.num_experts):
+                out = self.experts[e](x_in[e])   # (B, k, D)
+                x_e.append(out)
+            x_e = torch.stack(x_e, dim=1)  # (B, E, k, D)
+
+            # === scatter back --> (B, S, D) ===
+            x_out = torch.zeros_like(x)
+            for e in range(self.num_experts):
+                idx = index[:, e, :]  # (B, k)
+                weight = gating[:, e, :].unsqueeze(-1)  # (B, k, 1)
+                contrib = x_e[:, e, :, :] * weight      # (B, k, D)
+                x_out = x_out.scatter_add(1, idx.unsqueeze(-1).expand(-1, -1, D), contrib)
 
         if self.n_shared_experts > 0:
             x_out = x_out + self.shared_experts(identity)
@@ -904,123 +1043,367 @@ class SparseMoEBlock(nn.Module):
         return x_out
 
 
-class ChannelMoEBlock(nn.Module):
-    """Channel-wise sparse MoE block.
+class PatchMoEBlock(nn.Module):
+    """Spatial MoE with patch tokenisation.
 
-    Instead of routing over spatial tokens (as ``SparseMoEBlock`` does),
-    this block divides the channel dimension into ``num_groups`` groups
-    ("channel tokens"), computes a global (spatial-averaged) routing signal,
-    and dispatches channel groups to experts via expert-choice top-k routing.
+    Instead of treating every pixel as a token (``SparseMoEBlock``), this
+    block first *patchifies* the spatial feature map into non-overlapping
+    ``patch_size x patch_size`` blocks, averages each block into a single
+    "patch token", routes those patch tokens to experts via expert-choice
+    top-k, runs each expert on the selected patch tokens, and finally
+    scatters the results back and un-patchifies.
 
-    Each expert is a lightweight MLP that operates on ``C_group``-dimensional
-    features (per spatial position, per channel group).
+    The expert MLP operates on the *same* channel dimension ``D`` as a
+    standard FFN – the only difference is that the routing granularity is
+    now a patch (e.g. 4x4) instead of a single pixel.
+
+    ``patch_size`` is read from ``moe_config['patch_size']`` (default 4).
+
+    For the heatmap visualisation each forward pass records which tokens
+    were selected by how many experts into ``self._last_select_count``
+    (detached, ``(B, T)`` where ``T`` is the number of patch tokens).
     """
 
-    def __init__(self, hidden_dim, num_groups, num_experts,
+    def __init__(self, experts, hidden_dim, num_experts,
+                 n_shared_experts=0, capacity=2, use_prompt=False,
+                 patch_size=4):
+        super().__init__()
+        self.experts = nn.ModuleList(experts)
+        self.capacity = capacity
+        self.num_experts = num_experts
+        self.patch_size = patch_size
+        self.hidden_dim = hidden_dim
+
+        # ---- gate: fuse [LN(mean), complexity_embed] -> logits ----
+        # Mean captures "what" the patch represents (direction).
+        # Intra-patch variance (differentiable entropy proxy) captures
+        # "how complex" the patch is, so the router can learn to send
+        # complex patches to specialised experts.
+        self.gate_norm = nn.LayerNorm(hidden_dim)
+        self.complexity_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.gate_linear = nn.Linear(hidden_dim * 2, num_experts)
+
+        self.n_shared_experts = n_shared_experts
+        if n_shared_experts > 0:
+            intermediate_size = hidden_dim * n_shared_experts
+            self.shared_experts = MoeMLP(
+                hidden_size=hidden_dim,
+                intermediate_size=intermediate_size,
+                pretraining_tp=2,
+            )
+
+        # Populated every forward for vis; (B, T)
+        self._last_select_count = None
+
+    # ------------------------------------------------------------------ #
+    #  helpers: patchify / un-patchify                                     #
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _patchify(x, ps):
+        """(B, H, W, D) -> (B, Th, Tw, ps, ps, D) -> (B, T, ps*ps, D)"""
+        B, H, W, D = x.shape
+        Th, Tw = H // ps, W // ps
+        x = x.reshape(B, Th, ps, Tw, ps, D)
+        x = x.permute(0, 1, 3, 2, 4, 5).contiguous()   # (B,Th,Tw,ps,ps,D)
+        x = x.reshape(B, Th * Tw, ps * ps, D)           # (B,T, ps^2, D)
+        return x, Th, Tw
+
+    @staticmethod
+    def _unpatchify(x, Th, Tw, ps):
+        """(B, T, ps*ps, D) -> (B, H, W, D)"""
+        B, T, P, D = x.shape
+        x = x.reshape(B, Th, Tw, ps, ps, D)
+        x = x.permute(0, 1, 3, 2, 4, 5).contiguous()
+        x = x.reshape(B, Th * ps, Tw * ps, D)
+        return x
+
+    def forward(self, x, prompt=None, x_size=None):
+        """
+        Args:
+            x: (B, S, D)  where S = H * W.
+            x_size: optional (H, W) tuple – avoids ambiguous factorisation.
+        Returns:
+            (B, S, D).
+        """
+        B, S, D = x.shape
+        ps = self.patch_size
+
+        if x_size is not None:
+            H, W = x_size
+        else:
+            # Infer spatial dims – assumes S = H * W with H, W divisible by ps.
+            H = W = int(math.sqrt(S))
+            if H * W != S:
+                # Non-square: find factors closest to sqrt
+                for h in range(int(math.sqrt(S)), 0, -1):
+                    if S % h == 0:
+                        H = h
+                        W = S // h
+                        break
+
+        # Pad if H or W not divisible by ps
+        pad_h = (ps - H % ps) % ps
+        pad_w = (ps - W % ps) % ps
+        if pad_h > 0 or pad_w > 0:
+            x_2d = x.reshape(B, H, W, D)
+            x_2d = F.pad(x_2d.permute(0, 3, 1, 2),
+                         (0, pad_w, 0, pad_h)).permute(0, 2, 3, 1)
+            Hp, Wp = H + pad_h, W + pad_w
+        else:
+            x_2d = x.reshape(B, H, W, D)
+            Hp, Wp = H, W
+
+        identity = x  # (B, S, D)
+
+        # ---- 1. patchify ----
+        patches, Th, Tw = self._patchify(x_2d, ps)  # (B, T, ps^2, D)
+        T = Th * Tw
+
+        # ---- 2. gate: complexity-aware routing ----
+        # patch mean: spatial average → "what" direction
+        patch_mean = patches.mean(dim=2)              # (B, T, D)
+        # intra-patch variance: differentiable entropy proxy → "how complex"
+        patch_var = patches.var(dim=2, unbiased=False) # (B, T, D)
+        # fuse: [LN(mean), proj(var)] → logits
+        gate_feat = torch.cat([
+            self.gate_norm(patch_mean),
+            self.complexity_proj(patch_var),
+        ], dim=-1)                                    # (B, T, 2D)
+        logits = self.gate_linear(gate_feat)          # (B, T, E)
+        affinity = torch.softmax(logits, dim=-1)      # (B, T, E)
+
+        # ---- 3. expert-choice top-k ----
+        affinity_T = affinity.permute(0, 2, 1)       # (B, E, T)
+        k = max(1, int((T / self.num_experts) * self.capacity))
+        gating, index = torch.topk(affinity_T, k=k, dim=-1)  # (B, E, k)
+
+        # ---- 4. record per-token selection count for vis ----
+        select_count = torch.zeros(B, T, device=x.device)
+        for e in range(self.num_experts):
+            ones = torch.ones_like(gating[:, e, :])   # (B, k)
+            select_count.scatter_add_(1, index[:, e, :], ones)
+        self._last_select_count = select_count.detach()  # (B, T)
+        self._last_grid_size = (Th, Tw)  # for vis heatmap
+
+        # ---- 5. expert forward ----
+        # Each expert processes its k patch tokens.
+        # A "patch token" here is the full patch (ps^2 pixels, each D-dim),
+        # but the expert MLP works on D-dim vectors (same as standard FFN).
+        # So we gather the selected patches, flatten pixels, run expert,
+        # reshape back.
+        x_out_patches = torch.zeros_like(patches)     # (B, T, ps^2, D)
+
+        # Per-token weight normalisation
+        flat_idx = index.reshape(B, self.num_experts * k)
+        flat_wt  = gating.reshape(B, self.num_experts * k)
+        total_wt = torch.zeros(B, T, device=x.device)
+        total_wt.scatter_add_(1, flat_idx, flat_wt)
+        total_wt_safe = total_wt.clamp(min=1e-8)
+
+        P = ps * ps  # pixels per patch
+
+        for e in range(self.num_experts):
+            idx = index[:, e, :]                       # (B, k)
+            wt  = gating[:, e, :]                      # (B, k)
+
+            # Normalise weight
+            tw_sel = torch.gather(total_wt_safe, 1, idx)  # (B, k)
+            wt_norm = wt / tw_sel                      # (B, k)
+
+            # Gather patches: (B, k, ps^2, D)
+            idx_exp = idx[:, :, None, None].expand(B, k, P, D)
+            p_sel = torch.gather(patches, 1, idx_exp)  # (B, k, P, D)
+
+            # Expert MLP on each pixel independently: (B*k*P, D) -> (B*k*P, D)
+            p_flat = p_sel.reshape(B * k * P, D)
+            p_proc = self.experts[e](p_flat)
+            p_proc = p_proc.reshape(B, k, P, D)
+
+            # Weight
+            wt_e = wt_norm[:, :, None, None]           # (B, k, 1, 1)
+            contrib = p_proc * wt_e
+
+            # Scatter back
+            x_out_patches.scatter_add_(1, idx_exp, contrib)
+
+        # ---- 6. shared experts ----
+        if self.n_shared_experts > 0:
+            sh_flat = patches.reshape(B * T * P, D)
+            sh_out = self.shared_experts(sh_flat)
+            x_out_patches = x_out_patches + sh_out.reshape(B, T, P, D)
+
+        # ---- 7. un-patchify ----
+        x_out_2d = self._unpatchify(x_out_patches, Th, Tw, ps)  # (B, Hp, Wp, D)
+
+        # Remove padding if added
+        if pad_h > 0 or pad_w > 0:
+            x_out_2d = x_out_2d[:, :H, :W, :]
+
+        return x_out_2d.reshape(B, S, D)
+
+
+class ChannelMoEBlock(nn.Module):
+    """Per-channel Mixture-of-Experts block.
+
+    Routes individual *channels* (not spatial tokens or channel groups)
+    to experts.  Each expert receives **all** channels assigned to it and
+    processes them as a single feature vector per spatial position.  The
+    output for each channel is the normalised weighted sum of all experts
+    that processed it, ensuring channels picked by multiple experts are
+    properly aggregated.  Channels not selected by any expert keep their
+    identity (no information loss).
+
+    Routing signal per channel:
+        feat = concat( LN(spatial_mean), energy_embed )   dim = 2
+        logits = Linear(feat) -> (B, C, E) -> softmax
+
+    Expert-choice top-k: each expert picks the top-k channels (from C)
+    with the highest affinity.  k = (C / E) * capacity.
+
+    Expert architecture: ``k -> hidden -> k`` MLP applied per spatial
+    position (strict 2D input).
+
+    Constructor signature is kept backward-compatible with dispatch sites
+    that still pass ``num_groups`` (ignored) and ``hid_ratio``.
+    """
+
+    def __init__(self, hidden_dim, num_groups=None, num_experts=4,
                  capacity=2, hid_ratio=1, n_shared_experts=0):
         """
         Args:
-            hidden_dim: total channel dimension C.
-            num_groups: G – number of channel groups (must divide hidden_dim).
+            hidden_dim: C – total number of channels.
+            num_groups: *ignored* (kept for dispatch-site compatibility).
             num_experts: E – number of routed experts.
-            capacity: multiplier for top-k; k = (G / E) * capacity.
-            hid_ratio: expert hidden dim = group_dim * 4 // hid_ratio.
+            capacity: top-k multiplier; k = ceil(C / E * capacity).
+            hid_ratio: expert hidden = k * 4 // hid_ratio  (resolved at
+                       forward time since k depends on C).
             n_shared_experts: number of shared experts (0 = none).
         """
         super().__init__()
-        assert hidden_dim % num_groups == 0, (
-            f"hidden_dim ({hidden_dim}) must be divisible by num_groups ({num_groups})"
-        )
         self.hidden_dim = hidden_dim
-        self.num_groups = num_groups
-        self.group_dim = hidden_dim // num_groups   # C_group
         self.num_experts = num_experts
         self.capacity = capacity
+        self.hid_ratio = hid_ratio
+        # Keep for backward compat / vis code that reads it
+        self.num_groups = hidden_dim
+        self.group_dim = 1
 
-        # Gate: route channel groups to experts based on group features
-        self.gate_weight = nn.Parameter(torch.empty(self.group_dim, num_experts))
-        nn.init.normal_(self.gate_weight, std=0.006)
+        C = hidden_dim
+        E = num_experts
 
-        # Experts: each maps C_group -> hidden -> C_group
-        expert_hidden = max(1, self.group_dim * 4 // hid_ratio)
+        # ---- Gate ----
+        # Per-channel routing: each channel is described by a 2-dim feature
+        #   [LN(spatial_mean_c),  energy_embed_c]
+        # LN operates per-channel (scalar), energy_embed maps scalar -> 1.
+        self.gate_norm = nn.LayerNorm(1)
+        self.energy_proj = nn.Linear(1, 1)
+        self.gate_linear = nn.Linear(2, E)
+
+        # ---- Experts ----
+        # k (channels per expert) is deterministic given C and E
+        k = max(1, math.ceil(C / E * capacity))
+        expert_hidden = max(1, k * 4 // max(1, hid_ratio))
         self.experts = nn.ModuleList([
-            Mlp(in_features=self.group_dim,
-                hidden_features=expert_hidden,
-                out_features=self.group_dim)
-            for _ in range(num_experts)
+            nn.Sequential(
+                nn.Linear(k, expert_hidden),
+                nn.GELU(),
+                nn.Linear(expert_hidden, k),
+            )
+            for _ in range(E)
         ])
+        self._k = k  # cached for forward
 
-        # Optional shared experts (operate per-group as well)
+        # ---- Optional shared expert ----
         self.n_shared_experts = n_shared_experts
         if n_shared_experts > 0:
-            self.shared_experts = MoeMLP(
-                hidden_size=self.group_dim,
-                intermediate_size=self.group_dim * n_shared_experts,
-                pretraining_tp=1,          # group_dim is small, no need for TP
+            shared_hidden = max(1, C * n_shared_experts)
+            self.shared_experts = nn.Sequential(
+                nn.Linear(C, shared_hidden),
+                nn.SiLU(),
+                nn.Linear(shared_hidden, C),
             )
 
     def forward(self, x, prompt=None):
         """
         Args:
-            x: (B, S, C) where S = H*W, C = hidden_dim.
+            x: (B, S, C) where S = H*W.
         Returns:
-            (B, S, C) – same shape as input.
+            (B, S, C).
         """
         B, S, C = x.shape
-        G  = self.num_groups
-        Cg = self.group_dim
+        E = self.num_experts
+        k = self._k  # channels per expert
 
-        # ---- 1. channel grouping ----
-        # (B, S, C) -> (B, S, G, Cg)
-        x_grouped = x.reshape(B, S, G, Cg)
-        identity_grouped = x_grouped
+        # ---- 1. per-channel routing signal ----
+        # spatial mean per channel: (B, C)
+        ch_mean = x.mean(dim=1)                                # (B, C)
+        # per-channel L2 energy (avg over spatial): (B, C)
+        ch_energy = x.norm(dim=1)                              # (B, C)
+        # norm operates on S dim → actually we want per-element energy,
+        # use mean of abs or std; here: RMS = sqrt(mean(x^2)) per channel
+        ch_energy = (x ** 2).mean(dim=1).sqrt()                # (B, C)
 
-        # ---- 2. global routing signal (spatial avg-pool) ----
-        # (B, S, G, Cg) -> mean over S -> (B, G, Cg)
-        x_pool = x_grouped.mean(dim=1)
+        # Build 2D feature per channel: (B, C, 2)
+        feat_dir = self.gate_norm(ch_mean.unsqueeze(-1))       # (B, C, 1)
+        feat_eng = self.energy_proj(ch_energy.unsqueeze(-1))   # (B, C, 1)
+        gate_feat = torch.cat([feat_dir, feat_eng], dim=-1)    # (B, C, 2)
 
-        # ---- 3. gate logits & affinity ----
-        # (B, G, Cg) @ (Cg, E) -> (B, G, E)
-        logits = x_pool @ self.gate_weight
-        affinity = torch.softmax(logits, dim=-1)   # (B, G, E)
+        # ---- 2. gate logits ----
+        logits = self.gate_linear(gate_feat)                   # (B, C, E)
+        # softmax over experts for each channel
+        affinity = torch.softmax(logits, dim=-1)               # (B, C, E)
 
-        # ---- 4. expert-choice top-k ----
-        affinity_T = affinity.permute(0, 2, 1)     # (B, E, G)
-        k = max(1, int((G / self.num_experts) * self.capacity))
-        gating, index = torch.topk(affinity_T, k=k, dim=-1)  # (B, E, k)
+        # ---- 3. expert-choice top-k ----
+        affinity_T = affinity.permute(0, 2, 1)                # (B, E, C)
+        gating, index = torch.topk(affinity_T, k=k, dim=-1)   # (B, E, k)
+
+        # ---- 4. per-channel weight normalisation (vectorised) ----
+        flat_idx = index.reshape(B, E * k)                     # (B, E*k)
+        flat_wt  = gating.reshape(B, E * k)                    # (B, E*k)
+
+        total_weight = torch.zeros(B, C, device=x.device)
+        total_weight.scatter_add_(1, flat_idx, flat_wt)        # (B, C)
+        # Channels with total_weight == 0 are not selected → identity
+        # For selected channels, normalise weights to sum to 1
+        total_weight_safe = total_weight.clamp(min=1e-8)
+
+        tw_per_slot = torch.gather(total_weight_safe, 1, flat_idx)  # (B, E*k)
+        wt_norm = (flat_wt / tw_per_slot).reshape(B, E, k)    # (B, E, k)
 
         # ---- 5. expert forward ----
-        x_out_grouped = torch.zeros_like(x_grouped)  # (B, S, G, Cg)
+        # x: (B, S, C) → gather k channels per expert
+        # index: (B, E, k) channel indices
+        # We need (B, E, S, k) — gather along C dim of x
+        idx_exp = index[:, :, None, :].expand(B, E, S, k)     # (B, E, S, k)
+        x_exp = x.unsqueeze(1).expand(B, E, S, C)             # (B, E, S, C)
+        x_sel = torch.gather(x_exp, 3, idx_exp)               # (B, E, S, k)
 
-        for e in range(self.num_experts):
-            idx = index[:, e, :]                      # (B, k)
-            wt  = gating[:, e, :]                     # (B, k)
+        # Each expert processes (B*S, k) → (B*S, k)  — strict 2D
+        expert_out = []
+        for e in range(E):
+            inp_2d = x_sel[:, e].reshape(B * S, k)            # (B*S, k)
+            out_2d = self.experts[e](inp_2d)                   # (B*S, k)
+            expert_out.append(out_2d.reshape(B, S, k))
+        expert_out = torch.stack(expert_out, dim=1)            # (B, E, S, k)
 
-            # gather channel groups across all spatial positions
-            # idx_exp: (B, S, k, Cg)
-            idx_exp = idx[:, None, :, None].expand(B, S, k, Cg)
-            x_sel = torch.gather(x_grouped, 2, idx_exp)   # (B, S, k, Cg)
+        # ---- 6. weighted aggregation ----
+        # Multiply each expert's output by its normalised weight
+        wt_exp = wt_norm[:, :, None, :]                        # (B, E, 1, k)
+        weighted = expert_out * wt_exp                         # (B, E, S, k)
 
-            # expert MLP: (B*S, k, Cg) -> (B*S, k, Cg)
-            x_flat = x_sel.reshape(B * S, k, Cg)
-            x_proc = self.experts[e](x_flat)
-            x_proc = x_proc.reshape(B, S, k, Cg)
+        # Scatter-add back to full C dimension
+        x_out = torch.zeros(B, E, S, C, device=x.device)
+        x_out.scatter_add_(3, idx_exp, weighted)               # (B, E, S, C)
+        x_out = x_out.sum(dim=1)                               # (B, S, C)
 
-            # weight by gating score
-            wt_exp = wt[:, None, :, None]              # (B, 1, k, 1)
-            contrib = x_proc * wt_exp
 
-            # scatter back
-            x_out_grouped.scatter_add_(2, idx_exp, contrib)
-
-        # ---- 6. shared experts (per-group) ----
+        # ---- 7. shared expert ----
         if self.n_shared_experts > 0:
-            id_flat = identity_grouped.reshape(B * S, G, Cg)
-            shared_out = self.shared_experts(id_flat)      # (B*S, G, Cg)
-            x_out_grouped = x_out_grouped + shared_out.reshape(B, S, G, Cg)
+            # (B*S, C) → (B*S, C)
+            x_shared = self.shared_experts(x.reshape(B * S, C))
+            x_out = x_out + x_shared.reshape(B, S, C)
 
-        # ---- 7. reshape back ----
-        return x_out_grouped.reshape(B, S, C)
+        return x_out
 
 
 # class SparseMoEBlock(nn.Module):

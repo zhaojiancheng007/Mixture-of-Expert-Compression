@@ -1,0 +1,64 @@
+# standalone inference config for examples/tcm_tome_infer.py
+
+name: tcm_tome_kodak
+out_dir: ./inference/tcm_tome
+
+# data
+dataset_kodak: /home/zjc/data/kodak/
+test_batch_size: 1
+num_workers: 4
+
+# family: TCM | TIC | TinyLIC
+# 脚本会自动跑两次:
+#   1) baseline: model family本体
+#   2) tome:     对应 *_TOME 新模型
+model: TIC
+N: 128
+M: 192
+Z: 192
+tcm_config: [2, 2, 2, 2, 2, 2]
+head_dim: [8, 16, 32, 32, 16, 8]
+drop_path_rate: 0
+num_slices: 5
+max_support_slices: 5
+
+# ToMe options (used by TCM_TOME / TIC_TOME / TinyLIC_TOME)
+enc_tome: true
+dec_tome: true
+h_tome: false
+tome_config:
+  enable: true
+  eval_only: true
+  sx: 2
+  sy: 2
+  use_rand: false
+  reduce: mean
+  merge_attn: true
+  merge_mlp: false
+  max_tokens: 8192
+  max_pairs: 16000000
+
+# checkpoints (按 family 自动选择)
+checkpoint: /home/zjc/MoECodec/ECCV2024-AdpatICMH/codec_ckpt/base_codec_1.pth.tar
+checkpoint_base: ""
+checkpoint_tome: ""
+
+checkpoint_tcm: ""
+checkpoint_tcm_tome: ""
+
+checkpoint_tic: ""
+checkpoint_tic_tome: ""
+
+checkpoint_tinylic: ""
+checkpoint_tinylic_tome: ""
+
+# runtime
+cuda: true
+gpu_id: 0
+seed: 42
+update_entropy: true
+
+# evaluation modes
+eval_forward: true   # forward() based estimated bpp/psnr
+eval_codec: true     # compress()/decompress() real bitstream bpp/psnr
+save_recon: true

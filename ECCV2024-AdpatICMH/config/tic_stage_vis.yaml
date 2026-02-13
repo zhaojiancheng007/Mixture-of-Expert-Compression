@@ -1,0 +1,48 @@
+# TIC training + Kodak eval + block-level spatial pattern tracking
+
+# data
+dataset: /home/zjc/data/flicker
+dataset_kodak: /home/zjc/data/kodak/
+
+# output
+out_dir: ./checkpoints/tic_stage_vis/
+
+# train
+epochs: 31
+batch_size: 8
+test_batch_size: 1
+num_workers: 16
+patch_size: 256
+seed: 42
+clip_max_norm: 1.0
+save: true
+
+# model
+N: 128
+M: 192
+
+# RD
+lmbda: 5e-3
+learning_rate: 0.0001
+aux_learning_rate: 0.001
+milestones: [10, 15, 20]
+gamma: 0.5
+
+# device
+cuda: true
+gpu_id: 0
+
+# checkpoint (empty means train from scratch)
+checkpoint: ""
+resume: false
+
+# Kodak eval interval (set to 1 for every epoch)
+eval_every: 1
+
+# block-level spatial maps on Kodak
+spatial_save_images: 8
+spatial_blur_kernel: 5
+spatial_map_low_pct: 1.0
+spatial_map_high_pct: 99.0
+spatial_save_npy: true
+spatial_block_names: [g_a1, g_a3, g_a5, g_a7, g_s0, g_s2, g_s4, g_s6]

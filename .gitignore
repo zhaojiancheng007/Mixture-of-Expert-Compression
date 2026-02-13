@@ -42,7 +42,6 @@ checkpoint/
 ckpt/
 pretrained/
 weights/
-models/
 *.pth
 *.pt
 *.ckpt

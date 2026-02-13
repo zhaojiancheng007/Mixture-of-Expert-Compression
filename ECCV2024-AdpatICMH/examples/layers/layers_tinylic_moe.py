@@ -46,7 +46,7 @@ from .layers_tinylic import (
     MultistageMaskedConv2d,
     Mlp,
 )
-from .moe_layers import SparseMoEBlock, ChannelMoEBlock
+from .moe_layers import SparseMoEBlock, ChannelMoEBlock, PatchMoEBlock
 
 
 __all__ = [
@@ -96,6 +96,22 @@ class NSABlock(nn.Module):
                     hid_ratio=moe_config.get('hid_ratio', 1),
                     n_shared_experts=moe_config['n_shared_experts'],
                 )
+            elif moe_type == 'patch':
+                _ps = moe_config.get('patch_size', 4)
+                self.moe_mlp = PatchMoEBlock(
+                    experts=[
+                        Mlp(in_features=dim,
+                            hidden_features=mlp_hidden_dim // moe_config['hid_ratio'],
+                            act_layer=act_layer, drop=drop)
+                        for _ in range(moe_config['num_experts'])
+                    ],
+                    hidden_dim=dim,
+                    num_experts=moe_config['num_experts'],
+                    capacity=moe_config['capacity'],
+                    n_shared_experts=moe_config['n_shared_experts'],
+                    use_prompt=False,
+                    patch_size=_ps,
+                )
             else:
                 self.moe_mlp = SparseMoEBlock(
                     experts=[
@@ -109,6 +125,7 @@ class NSABlock(nn.Module):
                     capacity=moe_config['capacity'],
                     n_shared_experts=moe_config['n_shared_experts'],
                     use_prompt=False,
+                    mix_batch_token=moe_config.get('mix_batch_token', False),
                 )
         else:
             self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim,
@@ -127,10 +144,17 @@ class NSABlock(nn.Module):
         x = shortcut + self.drop_path(x)
 
         if self.use_moe:
-            # SparseMoEBlock expects (B, S, D) -- flatten spatial dims
+            # MoE blocks expect (B, S, D) -- flatten spatial dims
             B, H, W, C = x.shape
             x_flat = x.reshape(B, H * W, C)
-            x_flat = x_flat + self.drop_path(self.moe_mlp(self.norm2(x_flat)))
+            if isinstance(self.moe_mlp, PatchMoEBlock):
+                x_flat = x_flat + self.drop_path(
+                    self.moe_mlp(self.norm2(x_flat), x_size=(H, W)))
+            elif isinstance(self.moe_mlp, SparseMoEBlock):
+                x_flat = x_flat + self.drop_path(
+                    self.moe_mlp(self.norm2(x_flat), x_size=(H, W)))
+            else:
+                x_flat = x_flat + self.drop_path(self.moe_mlp(self.norm2(x_flat)))
             x = x_flat.reshape(B, H, W, C)
         else:
             x = x + self.drop_path(self.mlp(self.norm2(x)))

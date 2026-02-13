@@ -39,7 +39,7 @@ import numpy as np
 import math
 
 from .utils import conv, update_registered_buffers
-from layers.moe_layers import SparseMoEBlock, ChannelMoEBlock, Mlp
+from layers.moe_layers import SparseMoEBlock, ChannelMoEBlock, PatchMoEBlock, Mlp
 
 
 SCALES_MIN = 0.11
@@ -164,6 +164,22 @@ class Block(nn.Module):
                     hid_ratio=moe_config.get('hid_ratio', 1),
                     n_shared_experts=moe_config['n_shared_experts'],
                 )
+            elif moe_type == 'patch':
+                _ps = moe_config.get('patch_size', 4)
+                self.moe_mlp = PatchMoEBlock(
+                    experts=[
+                        Mlp(in_features=input_dim,
+                            hidden_features=mlp_hidden_dim // moe_config['hid_ratio'],
+                            out_features=output_dim)
+                        for _ in range(moe_config['num_experts'])
+                    ],
+                    hidden_dim=input_dim,
+                    num_experts=moe_config['num_experts'],
+                    capacity=moe_config['capacity'],
+                    n_shared_experts=moe_config['n_shared_experts'],
+                    use_prompt=False,
+                    patch_size=_ps,
+                )
             else:
                 self.moe_mlp = SparseMoEBlock(
                     experts=[
@@ -177,6 +193,7 @@ class Block(nn.Module):
                     capacity=moe_config['capacity'],
                     n_shared_experts=moe_config['n_shared_experts'],
                     use_prompt=False,
+                    mix_batch_token=moe_config.get('mix_batch_token', False),
                 )
         else:
             self.mlp = nn.Sequential(
@@ -195,10 +212,17 @@ class Block(nn.Module):
         x = x + self.drop_path(self.msa(self.ln1(x)))
 
         if self.use_moe:
-            # SparseMoEBlock expects (B, S, D) -- flatten spatial dims
+            # MoE blocks expect (B, S, D) -- flatten spatial dims
             B, H, W, C = x.shape
             x_flat = x.reshape(B, H * W, C)
-            x_flat = x_flat + self.drop_path(self.moe_mlp(self.ln2(x_flat)))
+            if isinstance(self.moe_mlp, PatchMoEBlock):
+                x_flat = x_flat + self.drop_path(
+                    self.moe_mlp(self.ln2(x_flat), x_size=(H, W)))
+            elif isinstance(self.moe_mlp, SparseMoEBlock):
+                x_flat = x_flat + self.drop_path(
+                    self.moe_mlp(self.ln2(x_flat), x_size=(H, W)))
+            else:
+                x_flat = x_flat + self.drop_path(self.moe_mlp(self.ln2(x_flat)))
             x = x_flat.reshape(B, H, W, C)
         else:
             x = x + self.drop_path(self.mlp(self.ln2(x)))
@@ -332,6 +356,7 @@ class TCM_MoE(CompressionModel):
         # MoE configuration
         enc_moe = args.enc_moe
         dec_moe = args.dec_moe
+        h_moe = args.h_moe
         moe_config = args.moe_config
 
         self.config = config
@@ -359,7 +384,7 @@ class TCM_MoE(CompressionModel):
                        [ResidualBlockWithStride(2 * N, 2 * N, stride=2)]
         self.m_down3 = [ConvTransBlock(dim, dim, self.head_dim[2], self.window_size, dpr[i + begin],
                                        'W' if not i % 2 else 'SW',
-                                       use_moe=enc_moe, moe_config=moe_config)
+                                       use_moe=False, moe_config=moe_config)
                         for i in range(config[2])] + \
                        [conv3x3(2 * N, M, stride=2)]
 
@@ -368,7 +393,7 @@ class TCM_MoE(CompressionModel):
         # ---- g_s (decoder) : MoE-enabled ConvTransBlocks ----
         self.m_up1 = [ConvTransBlock(dim, dim, self.head_dim[3], self.window_size, dpr[i + begin],
                                      'W' if not i % 2 else 'SW',
-                                     use_moe=dec_moe, moe_config=moe_config)
+                                     use_moe=False, moe_config=moe_config)
                       for i in range(config[3])] + \
                      [ResidualBlockUpsample(2 * N, 2 * N, 2)]
         self.m_up2 = [ConvTransBlock(dim, dim, self.head_dim[4], self.window_size, dpr[i + begin],

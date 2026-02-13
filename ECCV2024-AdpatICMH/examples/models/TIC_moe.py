@@ -37,6 +37,7 @@ class TIC_MoE(nn.Module):
         # moe
         enc_moe = args.enc_moe
         dec_moe = args.dec_moe
+        h_moe = args.h_moe
         moe_config = args.moe_config
 
         # stochastic depth
@@ -117,7 +118,7 @@ class TIC_MoE(nn.Module):
                          drop_path=dpr[sum(depths[:4]):sum(depths[:5])],
                          norm_layer=norm_layer,
                          use_checkpoint=use_checkpoint,
-                         use_moe=False, moe_config=None
+                         use_moe=h_moe, moe_config=moe_config
         )
         self.h_a2 = conv(N, N, kernel_size=3, stride=2)
         self.h_a3 = RSTB(dim=N,
@@ -131,7 +132,7 @@ class TIC_MoE(nn.Module):
                          drop_path=dpr[sum(depths[:5]):sum(depths[:6])],
                          norm_layer=norm_layer,
                          use_checkpoint=use_checkpoint,
-                         use_moe=False, moe_config=None
+                         use_moe=h_moe, moe_config=moe_config
         )
 
         depths = depths[::-1]
@@ -147,7 +148,7 @@ class TIC_MoE(nn.Module):
                          drop_path=dpr[sum(depths[:0]):sum(depths[:1])],
                          norm_layer=norm_layer,
                          use_checkpoint=use_checkpoint,
-                         use_moe=False, moe_config=None
+                         use_moe=h_moe, moe_config=moe_config
         )
         self.h_s1 = deconv(N, N, kernel_size=3, stride=2)
         self.h_s2 = RSTB(dim=N,
@@ -161,7 +162,7 @@ class TIC_MoE(nn.Module):
                          drop_path=dpr[sum(depths[:1]):sum(depths[:2])],
                          norm_layer=norm_layer,
                          use_checkpoint=use_checkpoint,
-                         use_moe=False, moe_config=None
+                         use_moe=h_moe, moe_config=moe_config
         )
         self.h_s3 = deconv(N, M*2, kernel_size=3, stride=2)
 

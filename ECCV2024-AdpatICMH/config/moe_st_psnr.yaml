@@ -5,11 +5,10 @@ dataset_kodak: /home/zjc/data/kodak/
 dataset_clic: /home/zjc/data/CLICval2017/
 
 # 训练输出
-out_dir: ./checkpoints/
-name: TinyLIC_MoE
+out_dir: ./checkpoints/spatial/
 
 # 训练设置
-epochs: 20
+epochs: 31
 batch_size: 18
 test_batch_size: 1
 num_workers: 16
@@ -17,16 +16,17 @@ patch_size: 256
 seed: 42
 clip_max_norm: 1.0
 save: true
+train_mode: all
 
 # 模型: TIC, TIC_MoE, TinyLIC, TinyLIC_MoE, TCM, TCM_MoE
 # 各模型默认 N/M:
 #   TIC / TIC_MoE:       N=128, M=192
 #   TinyLIC / TinyLIC_MoE: N=128, M=320
 #   TCM / TCM_MoE:       N=64,  M=320, Z=192
-model: TinyLIC_MoE
-N: 128
+model: TCM_MoE
+N: 64
 M: 320
-# Z: 192     # 超先验瓶颈通道数 (仅 TCM/TCM_MoE 使用)
+Z: 192
 
 # RD loss, mse系数
 lmbda: 5e-3
@@ -35,31 +35,40 @@ distortion: mse
 # 优化器
 learning_rate: 0.0001
 aux_learning_rate: 0.001
+cosine_eta_min: 0.000001
 
 # scheduler
-milestones: [5,10,15]
-gamma: 0.1
+milestones: [5,15,20]
+gamma: 0.5
 
 # device
 cuda: true
 gpu_id: 0
 
-checkpoint: "/home/zjc/MoECodec/TinyLIC/pretrained/mse/checkpoint_q1.pth.tar"
+checkpoint: "/home/zjc/MoECodec/LIC_TCM/chexkpoints/0.025.pth.tar"
 TEST: False
 
 #moe
 enc_moe: True
 dec_moe: True
-h_moe: True
+h_moe: False
 moe_config:
-  # moe_type: "spatial" (默认, 对空间位置路由) 或 "channel" (对通道组路由)
-  moe_type: channel
+  # moe_type:
+  #   "spatial" (默认, 像素级路由)
+  #   "channel" (对通道路由)
+  #   "patch"   (先 patchify 再路由, patch token = patch_size x patch_size 像素块)
+  moe_type: spatial
+  # mix_batch_token: 仅 spatial SparseMoE 生效；True 时将 B 和 token 维合并后全局路由
+  mix_batch_token: False
+  # vis_region_size: energy-vs-compute 可视化时，多少像素聚合成1个token
+  vis_region_size: 4
+  # patch_size: patchify 的块大小 (仅 patch MoE 使用), 推荐 2 或 4
+  patch_size: 4
   # num_groups: 通道组数 (仅 channel MoE 使用), 必须整除所有 MoE 层的通道数
-  #   TIC/TIC_MoE: 需整除 128, 192 → 可选 4, 8, 16, 32, 64
-  #   TinyLIC/TinyLIC_MoE: 需整除 128, 192, 256, 320 → 可选 4, 8, 16, 32, 64
-  #   TCM/TCM_MoE: 需整除 128, 320 → 可选 4, 8, 16, 32, 64
   num_groups: 8
   num_experts: 4
   capacity: 1.0
   n_shared_experts: 0
   hid_ratio: 4
+  # 邻域一致性正则系数: L_smooth = sum_i ||∇p_i||_1
+  smooth_lambda: 0.001

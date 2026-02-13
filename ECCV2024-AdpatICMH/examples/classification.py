@@ -1,438 +1,467 @@
-# Copyright (c) 2021-2022, InterDigital Communications, Inc
-# All rights reserved.
+# classification.py
+# Task-aware compression training for classification.
+# Supports: TIC/TIC_MoE, TinyLIC/TinyLIC_MoE, TCM/TCM_MoE.
 
-# Redistribution and use in source and binary forms, with or without
-# modification, are permitted (subject to the limitations in the disclaimer
-# below) provided that the following conditions are met:
-
-# * Redistributions of source code must retain the above copyright notice,
-#   this list of conditions and the following disclaimer.
-# * Redistributions in binary form must reproduce the above copyright notice,
-#   this list of conditions and the following disclaimer in the documentation
-#   and/or other materials provided with the distribution.
-# * Neither the name of InterDigital Communications, Inc nor the names of its
-#   contributors may be used to endorse or promote products derived from this
-#   software without specific prior written permission.
-
-# NO EXPRESS OR IMPLIED LICENSES TO ANY PARTY'S PATENT RIGHTS ARE GRANTED BY
-# THIS LICENSE. THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND
-# CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT
-# NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
-# PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR
-# CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
-# EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
-# PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
-# OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
-# WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
-# OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
-# ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-
-from cmath import exp
-import tqdm
 import argparse
-import math
-import random
-import shutil
-import sys
-import os
-import time
 import logging
+import os
+import random
+import sys
 from datetime import datetime
 
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_DIR = os.path.dirname(_SCRIPT_DIR)
+for _p in (_PROJECT_DIR, _SCRIPT_DIR):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-
 import torchvision
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torchvision import transforms
 from torchvision.models import resnet50
-from compressai.zoo import mbt2018_mean
-from models.tic_sfma import TIC_SFMA
-
 import yaml
 
-class RateDistortionLoss(nn.Module):
-    """Custom rate distortion loss with a Lagrangian parameter."""
-
-    def __init__(self, lmbda=1e-2):
-        super().__init__()
-        self.mse = nn.MSELoss()
-        self.lmbda = lmbda
-    
-    def psnr(self, output, target):
-        mse = torch.mean((output - target) ** 2)
-        if(mse == 0):
-            return 100
-        max_pixel = 1.
-        psnr = 10 * torch.log10(max_pixel / mse)
-        return torch.mean(psnr)
-
-    def forward(self, output, target):
-        N, _, H, W = target.size()
-        out = {}
-        num_pixels = N * H * W
-
-        out["bpp_loss"] = sum(
-            (torch.log(likelihoods).sum() / (-math.log(2) * num_pixels))
-            for likelihoods in output["likelihoods"].values()
-        )
-        out["mse_loss"] = self.mse(output["x_hat"], target)
-        out["rdloss"] = self.lmbda * 255**2 * out["mse_loss"] + out["bpp_loss"]
-        out["psnr"] = self.psnr(torch.clamp(output["x_hat"],0,1), target)
-        return out
+from examples.task_train_utils import (
+    AverageMeter,
+    RateDistortionLoss,
+    build_model,
+    configure_optimizers,
+    get_bare_model,
+    init_out_dir,
+    load_checkpoint,
+    load_pretrained,
+    save_checkpoint,
+    setup_logger,
+)
 
 
-class FeatureHook():
+class FeatureHook:
     def __init__(self, module):
-        module.register_forward_hook(self.attach)
-    
-    def attach(self, model, input, output):
-        self.feature = output
+        self.feature = None
+        module.register_forward_hook(self._attach)
 
-class Clsloss(nn.Module):
-    def __init__(self, device, perceptual_loss=False) -> None:
+    def _attach(self, module, inp, out):
+        self.feature = out
+
+
+class ClassificationTaskLoss(nn.Module):
+    """Classification loss on reconstructed images, optional feature matching."""
+
+    def __init__(self, device, use_feature_loss=False):
         super().__init__()
         self.ce = nn.CrossEntropyLoss()
-        self.classifier = resnet50(True)
-        self.classifier.requires_grad_(False)
-        self.hooks = [FeatureHook(i) for i in [
-            self.classifier.layer1,
-            self.classifier.layer2,
-            self.classifier.layer3,
-            self.classifier.layer4,
-        ]]
-        self.classifier = self.classifier.to(device)
-        for k, p in self.classifier.named_parameters():
-            p.requires_grad = False
-        self.classifier.eval()
-        self.perceptual_loss = perceptual_loss
-        self.transform = transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        self.use_feature_loss = bool(use_feature_loss)
 
-    def accuracy(output, target, topk=(1,)):
-        maxk = max(topk)
-        batch_size = target.size(0)
-
-        _, pred = output.topk(maxk, 1, True, True)
-        pred = pred.t()
-        correct = pred.eq(target.view(1, -1).expand_as(pred))
-
-        res = []
-        for k in topk:
-            correct_k = correct[:k].view(-1).float().sum(0)
-            res.append(correct_k.mul_(100.0 / batch_size))
-        return res
-
-    def forward(self, output, d, y_true):
-        x_hat = torch.clamp(output["x_hat"],0,1)
-        pred = self.classifier(self.transform(x_hat))
-        loss = self.ce(pred, y_true)
-        accu = sum(torch.argmax(pred,-1)==y_true)/pred.shape[0]
-        if self.perceptual_loss:
-            pred_feat = [i.feature.clone() for i in self.hooks]
-            _ = self.classifier(self.transform(d))
-            ori_feat = [i.feature.clone() for i in self.hooks]
-            perc_loss = torch.stack([nn.functional.mse_loss(p,o, reduction='none').mean((1,2,3)) for p,o in zip(pred_feat, ori_feat)])
-            perc_loss = perc_loss.mean()
-            return loss, accu, perc_loss
-
-        return loss, accu, None
-
-class AverageMeter:
-    """Compute running average."""
-
-    def __init__(self):
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
-        self.count = 0
-
-    def update(self, val, n=1):
-        self.val = val
-        self.sum += val * n
-        self.count += n
-        self.avg = self.sum / self.count
-
-
-class CustomDataParallel(nn.DataParallel):
-    """Custom DataParallel to access the module methods."""
-
-    def __getattr__(self, key):
         try:
-            return super().__getattr__(key)
-        except AttributeError:
-            return getattr(self.module, key)
+            from torchvision.models import ResNet50_Weights
+            self.classifier = resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)
+        except Exception:
+            self.classifier = resnet50(pretrained=True)
+
+        self.classifier.requires_grad_(False)
+        self.classifier.eval().to(device)
+
+        self.hooks = [
+            FeatureHook(self.classifier.layer1),
+            FeatureHook(self.classifier.layer2),
+            FeatureHook(self.classifier.layer3),
+            FeatureHook(self.classifier.layer4),
+        ]
+
+        mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1)
+        self.register_buffer("mean", mean)
+        self.register_buffer("std", std)
+
+    def _norm(self, x):
+        return (x - self.mean) / self.std
+
+    def forward(self, out_net, x, y):
+        x_hat = torch.clamp(out_net["x_hat"], 0, 1)
+        pred = self.classifier(self._norm(x_hat))
+        ce_loss = self.ce(pred, y)
+        acc = (pred.argmax(dim=1) == y).float().mean()
+
+        feat_loss = torch.tensor(0.0, device=x_hat.device)
+        if self.use_feature_loss:
+            rec_feats = [h.feature.clone() for h in self.hooks]
+            _ = self.classifier(self._norm(x))
+            ori_feats = [h.feature.clone() for h in self.hooks]
+            feat_loss = torch.stack([
+                nn.functional.mse_loss(rf, of)
+                for rf, of in zip(rec_feats, ori_feats)
+            ]).mean()
+
+        return {
+            "ce_loss": ce_loss,
+            "acc": acc,
+            "feat_loss": feat_loss,
+        }
 
 
-def init(args):
-    base_dir = f'{args.root}/{args.exp_name}/{args.quality_level}/'
-    os.makedirs(base_dir, exist_ok=True)
-    return base_dir
+def _unwrap_batch(batch, device):
+    if isinstance(batch, (tuple, list)) and len(batch) >= 2:
+        x, y = batch[0], batch[1]
+    else:
+        raise ValueError("Classification batch must be (image, label).")
+    return x.to(device, non_blocking=True), y.to(device, non_blocking=True)
 
 
-def setup_logger(log_dir):
-    log_formatter = logging.Formatter("%(asctime)s [%(levelname)-5.5s]  %(message)s")
-    root_logger = logging.getLogger()
-    root_logger.setLevel(logging.INFO)
+def train_one_epoch(model, criterion_rd, criterion_task, train_loader,
+                    optimizer, aux_optimizer, clip_max_norm,
+                    task_lmbda, ce_weight, feat_weight):
+    model.train()
+    bare_model = get_bare_model(model)
+    device = next(model.parameters()).device
 
-    log_file_handler = logging.FileHandler(log_dir, encoding='utf-8')
-    log_file_handler.setFormatter(log_formatter)
-    root_logger.addHandler(log_file_handler)
+    bpp_m = AverageMeter()
+    psnr_m = AverageMeter()
+    ce_m = AverageMeter()
+    feat_m = AverageMeter()
+    task_m = AverageMeter()
+    total_m = AverageMeter()
+    aux_m = AverageMeter()
+    acc_m = AverageMeter()
 
-    log_stream_handler = logging.StreamHandler(sys.stdout)
-    log_stream_handler.setFormatter(log_formatter)
-    root_logger.addHandler(log_stream_handler)
+    for batch in train_loader:
+        x, y = _unwrap_batch(batch, device)
+        optimizer.zero_grad(set_to_none=True)
 
-    logging.info('Logging file is %s' % log_dir)
+        out_net = model(x)
+        out_rd = criterion_rd(out_net, x)
+        out_task = criterion_task(out_net, x, y)
 
+        task_loss = ce_weight * out_task["ce_loss"] + feat_weight * out_task["feat_loss"]
+        total_loss = out_rd["bpp_loss"] + task_lmbda * task_loss
 
-def configure_optimizers(net, args):
-    """Set optimizer for only the parameters for propmts"""
+        total_loss.backward()
 
+        if aux_optimizer is not None:
+            aux_loss = bare_model.aux_loss()
+            aux_optimizer.zero_grad(set_to_none=True)
+            aux_loss.backward()
+        else:
+            aux_loss = torch.tensor(0.0, device=device)
 
-    parameters = {
-        k
-        for k, p in net.named_parameters()
-        if "sfma" in k
-    }
+        if clip_max_norm and clip_max_norm > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), clip_max_norm)
 
-    params_dict = dict(net.named_parameters())
+        optimizer.step()
+        if aux_optimizer is not None:
+            aux_optimizer.step()
 
-    optimizer = optim.Adam(
-        (params_dict[n] for n in sorted(parameters)),
-        lr=args.learning_rate,
+        bs = x.size(0)
+        bpp_m.update(out_rd["bpp_loss"], bs)
+        psnr_m.update(out_rd["psnr"], bs)
+        ce_m.update(out_task["ce_loss"], bs)
+        feat_m.update(out_task["feat_loss"], bs)
+        task_m.update(task_loss, bs)
+        total_m.update(total_loss, bs)
+        aux_m.update(aux_loss, bs)
+        acc_m.update(out_task["acc"], bs)
+
+    logging.info(
+        "[Train] Total %.4f | Task %.4f | CE %.4f | Feat %.4f | BPP %.4f | PSNR %.2f | Acc %.4f | AUX %.2f",
+        total_m.avg, task_m.avg, ce_m.avg, feat_m.avg, bpp_m.avg, psnr_m.avg, acc_m.avg, aux_m.avg,
     )
 
-    return optimizer
+    return {
+        "total": total_m.avg,
+        "task": task_m.avg,
+        "ce": ce_m.avg,
+        "feat": feat_m.avg,
+        "bpp": bpp_m.avg,
+        "psnr": psnr_m.avg,
+        "acc": acc_m.avg,
+    }
 
-def train_one_epoch(
-    model, criterion_rd, criterion_cls, train_dataloader, optimizer, lmbda
-):
-    model.train()
-    device = next(model.parameters()).device
-    bpps =  AverageMeter()
-    accus =  AverageMeter()
-    total_losses = AverageMeter()
-    perc_losses  = AverageMeter()
-    data_times =AverageMeter()
-    model_times =AverageMeter()
-    start_time = time.time()
-    for i, (d,l) in enumerate(train_dataloader):
-        data_times.update(time.time()-start_time)
-        d = d.to(device)
-        l = l.to(device)
-        model_time= time.time()
-        optimizer.zero_grad()
-        
-        out_net = model(d)
 
-        out_criterion = criterion_rd(out_net, d)
-        loss, accu, perc_loss = criterion_cls(out_net, d, l)
-      
-        total_loss = lmbda*perc_loss + out_criterion['bpp_loss']
-        total_loss.backward()
-        optimizer.step()
- 
-       
-        model_times.update(time.time()-model_time)
-        if i%20==0:
-            accus.update(accu.item())
-            total_losses.update(total_loss.item())
-            perc_losses.update(perc_loss.item())
-            bpps.update(out_criterion['bpp_loss'].item())
-        if i%100==0 or i ==len(train_dataloader)-1:
-            update_txt=f'[{i*len(d)}/{len(train_dataloader.dataset)}] | data time :{data_times.avg:.4f} | model time :{model_times.avg:.4f} |Loss: {total_losses.avg:.3f} | perc loss: {perc_losses.avg:.5f} | Bpp loss: {bpps.avg:.4f} | Accs: {accus.avg:.3f}'
-            print(datetime.now(),update_txt)
-        start_time = time.time()
-
-    
-def test_epoch(epoch, test_dataloader, model, criterion_rd, criterion_cls, lmbda, stage='test'):
+@torch.no_grad()
+def eval_epoch(model, criterion_rd, criterion_task, data_loader,
+               task_lmbda, ce_weight, feat_weight, tag="Val"):
     model.eval()
     device = next(model.parameters()).device
 
-    loss_am = AverageMeter()
-    percloss = AverageMeter()
-    bpp_loss = AverageMeter()
-    mse_loss = AverageMeter()
-    aux_loss = AverageMeter()
-    psnr = AverageMeter()
-    accuracy = AverageMeter()
-    totalloss = AverageMeter()
+    bpp_m = AverageMeter()
+    psnr_m = AverageMeter()
+    ce_m = AverageMeter()
+    feat_m = AverageMeter()
+    task_m = AverageMeter()
+    total_m = AverageMeter()
+    acc_m = AverageMeter()
 
-    with torch.no_grad():
-        for i, (d,l) in enumerate(test_dataloader):
-            d = d.to(device)
-            l = l.to(device)
-            out_net = model(d)
-            out_criterion = criterion_rd(out_net, d)
-            loss, accu, perc_loss = criterion_cls(out_net, d, l)
-            total_loss = lmbda*perc_loss + out_criterion['bpp_loss']
+    for batch in data_loader:
+        x, y = _unwrap_batch(batch, device)
+        out_net = model(x)
+        out_rd = criterion_rd(out_net, x)
+        out_task = criterion_task(out_net, x, y)
 
-            aux_loss.update(model.aux_loss())
-            bpp_loss.update(out_criterion["bpp_loss"])
-            loss_am.update(loss)
-            mse_loss.update(out_criterion["mse_loss"])
-            psnr.update(out_criterion['psnr'])
-            accuracy.update(accu)
-            percloss.update(perc_loss)
-            totalloss.update(total_loss)
+        task_loss = ce_weight * out_task["ce_loss"] + feat_weight * out_task["feat_loss"]
+        total_loss = out_rd["bpp_loss"] + task_lmbda * task_loss
 
-            if i%100==0 or i ==len(test_dataloader)-1:
-                print(datetime.now(),f'[{i*len(d)}/{len(test_dataloader.dataset)}]',f"{epoch}  total loss:{totalloss.avg:.3f}| bpp loss: {bpp_loss.avg:.5f} | psnr: {psnr.avg:.5f} | accu: {accuracy.avg:.5f}")
- 
+        bs = x.size(0)
+        bpp_m.update(out_rd["bpp_loss"], bs)
+        psnr_m.update(out_rd["psnr"], bs)
+        ce_m.update(out_task["ce_loss"], bs)
+        feat_m.update(out_task["feat_loss"], bs)
+        task_m.update(task_loss, bs)
+        total_m.update(total_loss, bs)
+        acc_m.update(out_task["acc"], bs)
+
+    logging.info(
+        "[%s] Total %.4f | Task %.4f | CE %.4f | Feat %.4f | BPP %.4f | PSNR %.2f | Acc %.4f",
+        tag, total_m.avg, task_m.avg, ce_m.avg, feat_m.avg, bpp_m.avg, psnr_m.avg, acc_m.avg,
+    )
+
     model.train()
-    print(f"{epoch} total loss:{totalloss.avg:.3f}| bpp loss: {bpp_loss.avg:.5f} | psnr: {psnr.avg:.5f} | accu: {accuracy.avg:.5f}")
-    return  totalloss.avg
+    return {
+        "total": total_m.avg,
+        "task": task_m.avg,
+        "ce": ce_m.avg,
+        "feat": feat_m.avg,
+        "bpp": bpp_m.avg,
+        "psnr": psnr_m.avg,
+        "acc": acc_m.avg,
+    }
 
-def save_checkpoint(state, is_best, base_dir, filename="checkpoint.pth.tar"):
-    torch.save(state, base_dir+filename)
-    if is_best:
-        shutil.copyfile(base_dir+filename, base_dir+"checkpoint_best_loss.pth.tar")
+
+def _build_imagenet_dataset(root, train_tf, val_tf):
+    try:
+        train_ds = torchvision.datasets.ImageNet(root, split="train", transform=train_tf)
+        val_ds = torchvision.datasets.ImageNet(root, split="val", transform=val_tf)
+        return train_ds, val_ds
+    except Exception as exc:
+        logging.warning("ImageNet loader failed (%s), fallback to ImageFolder train/val.", exc)
+        train_dir = os.path.join(root, "train")
+        val_dir = os.path.join(root, "val")
+        train_ds = torchvision.datasets.ImageFolder(train_dir, transform=train_tf)
+        val_ds = torchvision.datasets.ImageFolder(val_dir, transform=val_tf)
+        return train_ds, val_ds
+
 
 def parse_args(argv):
-    parser = argparse.ArgumentParser(description="Example training script.")
-    parser.add_argument(
-        "-c",
-        "--config",
-        default="config/vpt_default.yaml",
-        help="Path to config file",
-    )
-    parser.add_argument(
-        '--name', 
-        default=datetime.now().strftime('%Y-%m-%d_%H_%M_%S'), 
-        type=str,
-        help='Result dir name', 
-    )
-    given_configs, remaining = parser.parse_known_args(argv)
-    with open(given_configs.config) as file:
-        yaml_data= yaml.safe_load(file)
-        parser.set_defaults(**yaml_data)
-    
-    parser.add_argument(
-        "-T",
-        "--TEST",
-        action='store_true',
-        help='Testing'
-    )
+    parser = argparse.ArgumentParser("classification task training (yaml config)")
+    parser.add_argument("-c", "--config", type=str, default="config/classification.yaml")
+    parser.add_argument("-T", "--TEST", action="store_true")
+    cli = parser.parse_args(argv)
 
-    args = parser.parse_args(remaining)
+    with open(cli.config, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+    if not isinstance(cfg, dict):
+        raise ValueError("YAML config must be a dict at top level.")
+
+    args = argparse.Namespace(**cfg)
+    args.config = cli.config
+    if cli.TEST:
+        args.TEST = True
+
+    if not hasattr(args, "name"):
+        args.name = datetime.now().strftime("%Y-%m-%d_%H_%M_%S")
+
+    defaults = {
+        "dataset": "imagenet",
+        "epochs": 30,
+        "batch_size": 16,
+        "test_batch_size": 32,
+        "num_workers": 8,
+        "learning_rate": 1e-4,
+        "aux_learning_rate": 1e-3,
+        "clip_max_norm": 1.0,
+        "cuda": True,
+        "gpu_id": 0,
+        "seed": 42,
+        "save": True,
+        "eval_every": 1,
+        "lmbda": 5e-3,
+        "distortion": "mse",
+        "task_lmbda": 1.0,
+        "task_ce_weight": 0.0,
+        "task_feat_weight": 1.0,
+        "use_task_feat": True,
+        "train_subset_size": 0,
+        "milestones": [15, 25],
+        "gamma": 0.5,
+        "checkpoint": "",
+        "pretrained": "",
+        "resume": False,
+        "TEST": False,
+        "model": "TIC_MoE",
+        "N": 128,
+        "M": 192,
+        "enc_moe": True,
+        "dec_moe": True,
+        "h_moe": False,
+        "moe_config": None,
+        "train_moe": True,
+    }
+    for k, v in defaults.items():
+        if not hasattr(args, k):
+            setattr(args, k, v)
+
+    if not hasattr(args, "dataset_path"):
+        raise ValueError("Missing required key: dataset_path")
+
     return args
 
 
 def main(argv):
     args = parse_args(argv)
-    base_dir = init(args)
 
     if args.seed is not None:
         torch.manual_seed(args.seed)
+        np.random.seed(args.seed)
         random.seed(args.seed)
-    
-    setup_logger(base_dir + '/' + time.strftime('%Y%m%d_%H%M%S') + '.log')
-    msg = f'======================= {args.name} ======================='
-    logging.info(msg)
-    for k in args.__dict__:
-        logging.info(k + ':' + str(args.__dict__[k]))
-    logging.info('=' * len(msg))
 
-    cls_transforms = transforms.Compose(
-        [transforms.Resize(256), transforms.CenterCrop(256), transforms.ToTensor()]
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)
+    device = torch.device("cuda" if args.cuda and torch.cuda.is_available() else "cpu")
+
+    out_dir = init_out_dir(args, task_name="classification")
+    setup_logger(os.path.join(out_dir, "train.log"))
+
+    logging.info("========== %s =========", args.name)
+    logging.info("Config: %s", args.config)
+    logging.info("Model: %s  | N=%s M=%s", args.model, args.N, args.M)
+    logging.info("Dataset: %s  | path=%s", args.dataset, args.dataset_path)
+    logging.info("Device: %s", str(device))
+    logging.info("Task loss: lmbda=%.4f  ce_w=%.3f  feat_w=%.3f", args.task_lmbda, args.task_ce_weight, args.task_feat_weight)
+
+    train_tf = transforms.Compose([
+        transforms.Resize(256),
+        transforms.RandomCrop(256),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+    ])
+    eval_tf = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(256),
+        transforms.ToTensor(),
+    ])
+
+    dataset_name = str(args.dataset).lower()
+    if dataset_name in ("imagenet", "imagenet1k", "imagenet-1k"):
+        train_ds, val_ds = _build_imagenet_dataset(args.dataset_path, train_tf, eval_tf)
+    else:
+        train_dir = os.path.join(args.dataset_path, "train")
+        val_dir = os.path.join(args.dataset_path, "val")
+        train_ds = torchvision.datasets.ImageFolder(train_dir, transform=train_tf)
+        val_ds = torchvision.datasets.ImageFolder(val_dir, transform=eval_tf)
+
+    if int(args.train_subset_size) > 0:
+        n = min(int(args.train_subset_size), len(train_ds))
+        indices = torch.randperm(len(train_ds))[:n].tolist()
+        train_ds = Subset(train_ds, indices)
+        logging.info("Using train subset: %d samples", len(train_ds))
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
+        drop_last=True,
     )
-    train_transforms = transforms.Compose([
-    transforms.Resize(256),
-    transforms.RandomCrop(256),
-    transforms.RandomHorizontalFlip(),		
-    transforms.ToTensor()				
-])
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=args.test_batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
+    )
 
-    if args.dataset=='imagenet':
-        train_dataset = torchvision.datasets.ImageNet(args.dataset_path,split='train', transform=train_transforms)
-        test_dataset = torchvision.datasets.ImageNet(args.dataset_path,split='val', transform=cls_transforms)
-        val_dataset = test_dataset
-        small_train_datasets = torch.utils.data.random_split(train_dataset,[80000]*16+[1167])
+    net = build_model(args).to(device)
+    if args.cuda and torch.cuda.device_count() > 1:
+        net = nn.DataParallel(net)
 
-    os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu_id)
-    device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
+    criterion_rd = RateDistortionLoss(lmbda=args.lmbda, distortion=args.distortion).to(device)
+    criterion_task = ClassificationTaskLoss(
+        device=device,
+        use_feature_loss=(bool(args.use_task_feat) or float(args.task_feat_weight) > 0),
+    ).to(device)
 
-    val_dataloader = DataLoader(val_dataset,batch_size=args.test_batch_size,num_workers=args.num_workers,shuffle=False,pin_memory=(device == "cuda"),)
-    test_dataloader = DataLoader(test_dataset,batch_size=args.test_batch_size,num_workers=args.num_workers,shuffle=False,pin_memory=(device == "cuda"),)
+    bare_net = get_bare_model(net)
+    optimizer, aux_optimizer = configure_optimizers(bare_net, args)
+    lr_scheduler = optim.lr_scheduler.MultiStepLR(
+        optimizer,
+        milestones=list(args.milestones),
+        gamma=float(args.gamma),
+    )
 
-    net = TIC_SFMA(N=128,M=192)
-    net = net.to(device)
-    # net.load_state_dict(mbt2018_mean(quality=4 , pretrained=True).state_dict(),strict=False)
-    print('total paramaters:',sum(p.numel() for p in net.parameters() )/1e6)
- 
-
-    for k, p in net.named_parameters():
-        if "sfma" not in k :
-            p.requires_grad = False
-    print('tuning paramaters:',sum(p.numel() for p in net.parameters() if p.requires_grad)/1e6)
-
-    optimizer = configure_optimizers(net, args)
-    lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[80,100], gamma=0.5)
-    rdcriterion = RateDistortionLoss()
-    clscriterion = Clsloss(device, True)
+    total_params = sum(p.numel() for p in bare_net.parameters()) / 1e6
+    trainable_params = sum(p.numel() for p in bare_net.parameters() if p.requires_grad) / 1e6
+    logging.info("Params: total=%.2fM  trainable=%.2fM", total_params, trainable_params)
 
     last_epoch = 0
-    if args.checkpoint: 
-        logging.info("Loading "+str(args.checkpoint))
-        checkpoint = torch.load(args.checkpoint, map_location=device)
-        if list(checkpoint["state_dict"].keys())[0][:7]=='module.':
-            from collections import OrderedDict
-            new_state_dict = OrderedDict()
-            for k, v in checkpoint["state_dict"].items():
-                name = k[7:] 
-                new_state_dict[name] = v
-        else:
-            new_state_dict = checkpoint['state_dict']
-        net.load_state_dict(new_state_dict, strict=True if args.TEST else False)
+    best_loss = float("inf")
 
-    if args.cuda and torch.cuda.device_count() > 1:
-        net = CustomDataParallel(net)
-    
+    if args.checkpoint and os.path.isfile(args.checkpoint):
+        if args.resume:
+            last_epoch, best_loss = load_checkpoint(
+                bare_net, optimizer, aux_optimizer, lr_scheduler,
+                args.checkpoint, device,
+            )
+            last_epoch += 1
+        else:
+            load_pretrained(bare_net, args.checkpoint, device)
+    elif args.pretrained and os.path.isfile(args.pretrained):
+        load_pretrained(bare_net, args.pretrained, device)
+
     if args.TEST:
-        best_loss = float("inf")
-        tqrange = tqdm.trange(last_epoch, args.epochs)
-        loss = test_epoch(-1, test_dataloader, net, rdcriterion,clscriterion, args.task_lmbda,'test')
+        eval_epoch(
+            net, criterion_rd, criterion_task, val_loader,
+            task_lmbda=float(args.task_lmbda),
+            ce_weight=float(args.task_ce_weight),
+            feat_weight=float(args.task_feat_weight),
+            tag="Test",
+        )
         return
 
-    best_loss = float("inf")
-    tqrange = tqdm.trange(last_epoch, args.epochs)
-    for epoch in tqrange:
-        print(' ')
-        train_dataloader = DataLoader(
-        small_train_datasets[epoch%16],
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        shuffle=True,
-        pin_memory=(device == "cuda"),
-        )
+    for epoch in range(last_epoch, int(args.epochs)):
+        logging.info("Epoch %d / %d  | lr=%.2e", epoch, int(args.epochs) - 1, optimizer.param_groups[0]["lr"])
         train_one_epoch(
-            net,
-            rdcriterion,
-            clscriterion,
-            train_dataloader,
-            optimizer,
-            args.task_lmbda
+            net, criterion_rd, criterion_task, train_loader,
+            optimizer, aux_optimizer,
+            clip_max_norm=float(args.clip_max_norm),
+            task_lmbda=float(args.task_lmbda),
+            ce_weight=float(args.task_ce_weight),
+            feat_weight=float(args.task_feat_weight),
         )
-        loss = test_epoch(epoch, val_dataloader, net, rdcriterion,clscriterion, args.task_lmbda,'val')
-        lr_scheduler.step()
 
-        is_best = loss < best_loss
-        best_loss = min(loss, best_loss)
-        print('best_loss:',best_loss)
+        do_eval = ((epoch + 1) % int(args.eval_every) == 0) or (epoch == int(args.epochs) - 1)
+        if do_eval:
+            val_stats = eval_epoch(
+                net, criterion_rd, criterion_task, val_loader,
+                task_lmbda=float(args.task_lmbda),
+                ce_weight=float(args.task_ce_weight),
+                feat_weight=float(args.task_feat_weight),
+                tag="Val",
+            )
+            is_best = val_stats["total"] < best_loss
+            best_loss = min(best_loss, val_stats["total"])
+            logging.info("Best val total loss: %.4f", best_loss)
+        else:
+            val_stats = {"total": float("inf")}
+            is_best = False
+
+        lr_scheduler.step()
 
         if args.save:
             save_checkpoint(
                 {
                     "epoch": epoch,
-                    "state_dict": net.state_dict(),
-                    "loss": loss,
+                    "state_dict": bare_net.state_dict(),
+                    "loss": float(val_stats["total"]),
                     "optimizer": optimizer.state_dict(),
+                    "aux_optimizer": aux_optimizer.state_dict() if aux_optimizer is not None else {},
                     "lr_scheduler": lr_scheduler.state_dict(),
+                    "args": vars(args),
                 },
-                is_best,
-                base_dir,
-                filename='checkpoint.pth.tar'
+                is_best=is_best,
+                out_dir=out_dir,
+                filename="checkpoint.pth.tar",
             )
 
 

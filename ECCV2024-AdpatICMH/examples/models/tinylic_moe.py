@@ -58,6 +58,7 @@ class TinyLIC_MoE(nn.Module):
         # MoE configuration
         enc_moe = args.enc_moe
         dec_moe = args.dec_moe
+        h_moe = args.h_moe
         moe_config = args.moe_config
 
         depths = [2, 2, 6, 2, 2, 2]
@@ -124,7 +125,7 @@ class TinyLIC_MoE(nn.Module):
                         drop_rate=drop_rate, attn_drop_rate=attn_drop_rate,
                         drop_path_rate=dpr[sum(depths[:3]):sum(depths[:4])],
                         norm_layer=norm_layer,
-                        use_moe=enc_moe, moe_config=moe_config,
+                        use_moe=False, moe_config=moe_config,
         )
 
         # ---- h_a (hyper encoder) : always dense (no MoE) ----
@@ -138,7 +139,7 @@ class TinyLIC_MoE(nn.Module):
                          drop_rate=drop_rate, attn_drop_rate=attn_drop_rate,
                          drop_path_rate=dpr[sum(depths[:4]):sum(depths[:5])],
                          norm_layer=norm_layer,
-                         use_moe=False, moe_config=None,
+                         use_moe=h_moe, moe_config=moe_config,
         )
         self.h_a2 = conv(N*3//2, N*3//2, kernel_size=3, stride=2)
         self.h_a3 = ResViTBlock(dim=N*3//2,
@@ -150,7 +151,7 @@ class TinyLIC_MoE(nn.Module):
                          drop_rate=drop_rate, attn_drop_rate=attn_drop_rate,
                          drop_path_rate=dpr[sum(depths[:5]):sum(depths[:6])],
                          norm_layer=norm_layer,
-                         use_moe=False, moe_config=None,
+                         use_moe=h_moe, moe_config=moe_config,
         )
 
         # ---- h_s (hyper decoder) : always dense (no MoE) ----
@@ -165,7 +166,7 @@ class TinyLIC_MoE(nn.Module):
                          drop_rate=drop_rate, attn_drop_rate=attn_drop_rate,
                          drop_path_rate=dpr[sum(depths[:0]):sum(depths[:1])],
                          norm_layer=norm_layer,
-                         use_moe=False, moe_config=None,
+                         use_moe=h_moe, moe_config=moe_config,
         )
         self.h_s1 = deconv(N*3//2, N*3//2, kernel_size=3, stride=2)
         self.h_s2 = ResViTBlock(dim=N*3//2,
@@ -177,7 +178,7 @@ class TinyLIC_MoE(nn.Module):
                          drop_rate=drop_rate, attn_drop_rate=attn_drop_rate,
                          drop_path_rate=dpr[sum(depths[:1]):sum(depths[:2])],
                          norm_layer=norm_layer,
-                         use_moe=False, moe_config=None,
+                         use_moe=h_moe, moe_config=moe_config,
         )
         self.h_s3 = deconv(N*3//2, M*2, kernel_size=3, stride=2)
 
@@ -191,7 +192,7 @@ class TinyLIC_MoE(nn.Module):
                         drop_rate=drop_rate, attn_drop_rate=attn_drop_rate,
                         drop_path_rate=dpr[sum(depths[:2]):sum(depths[:3])],
                         norm_layer=norm_layer,
-                        use_moe=dec_moe, moe_config=moe_config,
+                        use_moe=False, moe_config=moe_config,
         )
         self.g_s1 = deconv(M, N*2, kernel_size=3, stride=2)
         self.g_s2 = ResViTBlock(dim=N*2,
