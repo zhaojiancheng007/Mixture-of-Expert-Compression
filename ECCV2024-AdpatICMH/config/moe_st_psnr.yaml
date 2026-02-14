@@ -23,9 +23,9 @@ train_mode: all
 #   TIC / TIC_MoE:       N=128, M=192
 #   TinyLIC / TinyLIC_MoE: N=128, M=320
 #   TCM / TCM_MoE:       N=64,  M=320, Z=192
-model: TCM_MoE
-N: 64
-M: 320
+model: TIC_MoE
+N: 128
+M: 192
 Z: 192
 
 # RD loss, mse系数
@@ -45,7 +45,7 @@ gamma: 0.5
 cuda: true
 gpu_id: 0
 
-checkpoint: "/home/zjc/MoECodec/LIC_TCM/chexkpoints/0.013.pth..tar"
+checkpoint: "/home/zjc/MoECodec/ECCV2024-AdpatICMH/codec_ckpt/base_codec_1.pth.tar"
 TEST: False
 
 #moe

@@ -508,7 +508,7 @@ class TIC_MoE_vis(nn.Module):
                         drop_path=dpr[sum(depths[:3]):sum(depths[:4])],
                         norm_layer=norm_layer,
                         use_checkpoint=use_checkpoint,
-                        use_moe=enc_moe, moe_config=moe_config,
+                        use_moe=False, moe_config=moe_config,
                         use_prompt=False
         )
 
@@ -586,7 +586,7 @@ class TIC_MoE_vis(nn.Module):
                         drop_path=dpr[sum(depths[:2]):sum(depths[:3])],
                         norm_layer=norm_layer,
                         use_checkpoint=use_checkpoint,
-                        use_moe=dec_moe, moe_config=moe_config,
+                        use_moe=False, moe_config=moe_config,
                         use_prompt=False
         )
         self.g_s1 = deconv(M, N, kernel_size=3, stride=2)
