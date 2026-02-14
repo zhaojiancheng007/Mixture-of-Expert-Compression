@@ -2,7 +2,7 @@
 # 必填
 dataset: /home/zjc/data/flicker
 dataset_kodak: /home/zjc/data/kodak/
-dataset_clic: /home/zjc/data/CLICval2017/
+dataset_clic: /home/zjc/MoECodec/clic2020pro/
 
 # 训练输出
 out_dir: ./checkpoints/spatial/
@@ -29,7 +29,7 @@ M: 320
 Z: 192
 
 # RD loss, mse系数
-lmbda: 5e-3
+lmbda: 1e-3
 distortion: mse
 
 # 优化器
@@ -45,7 +45,7 @@ gamma: 0.5
 cuda: true
 gpu_id: 0
 
-checkpoint: "/home/zjc/MoECodec/LIC_TCM/chexkpoints/0.025.pth.tar"
+checkpoint: "/home/zjc/MoECodec/LIC_TCM/chexkpoints/0.013.pth..tar"
 TEST: False
 
 #moe
@@ -58,8 +58,10 @@ moe_config:
   #   "channel" (对通道路由)
   #   "patch"   (先 patchify 再路由, patch token = patch_size x patch_size 像素块)
   moe_type: spatial
+  expert_type: lr_mlp
+  lr_rank: 32
   # mix_batch_token: 仅 spatial SparseMoE 生效；True 时将 B 和 token 维合并后全局路由
-  mix_batch_token: False
+  mix_batch_token: True
   # vis_region_size: energy-vs-compute 可视化时，多少像素聚合成1个token
   vis_region_size: 4
   # patch_size: patchify 的块大小 (仅 patch MoE 使用), 推荐 2 或 4

@@ -46,7 +46,12 @@ from .layers_tinylic import (
     MultistageMaskedConv2d,
     Mlp,
 )
-from .moe_layers import SparseMoEBlock, ChannelMoEBlock, PatchMoEBlock
+from .moe_layers import (
+    SparseMoEBlock,
+    ChannelMoEBlock,
+    PatchMoEBlock,
+    build_moe_experts,
+)
 
 
 __all__ = [
@@ -99,12 +104,14 @@ class NSABlock(nn.Module):
             elif moe_type == 'patch':
                 _ps = moe_config.get('patch_size', 4)
                 self.moe_mlp = PatchMoEBlock(
-                    experts=[
-                        Mlp(in_features=dim,
-                            hidden_features=mlp_hidden_dim // moe_config['hid_ratio'],
-                            act_layer=act_layer, drop=drop)
-                        for _ in range(moe_config['num_experts'])
-                    ],
+                    experts=build_moe_experts(
+                        in_features=dim,
+                        hidden_features=mlp_hidden_dim // moe_config['hid_ratio'],
+                        num_experts=moe_config['num_experts'],
+                        act_layer=act_layer,
+                        drop=drop,
+                        moe_config=moe_config,
+                    ),
                     hidden_dim=dim,
                     num_experts=moe_config['num_experts'],
                     capacity=moe_config['capacity'],
@@ -114,12 +121,14 @@ class NSABlock(nn.Module):
                 )
             else:
                 self.moe_mlp = SparseMoEBlock(
-                    experts=[
-                        Mlp(in_features=dim,
-                            hidden_features=mlp_hidden_dim // moe_config['hid_ratio'],
-                            act_layer=act_layer, drop=drop)
-                        for _ in range(moe_config['num_experts'])
-                    ],
+                    experts=build_moe_experts(
+                        in_features=dim,
+                        hidden_features=mlp_hidden_dim // moe_config['hid_ratio'],
+                        num_experts=moe_config['num_experts'],
+                        act_layer=act_layer,
+                        drop=drop,
+                        moe_config=moe_config,
+                    ),
                     hidden_dim=dim,
                     num_experts=moe_config['num_experts'],
                     capacity=moe_config['capacity'],

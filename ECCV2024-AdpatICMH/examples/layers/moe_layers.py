@@ -375,6 +375,69 @@ class Mlp(nn.Module):
         return x
 
 
+class LR_mlp(nn.Module):
+    """Low-rank MLP using factorised linear layers.
+
+    W1 ~= A1 @ B1, W2 ~= A2 @ B2, where rank r << d.
+    """
+    def __init__(self, in_features, hidden_features=None, out_features=None,
+                 rank=32, act_layer=nn.GELU, drop=0.):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        rank = max(1, int(rank))
+
+        # No bias by design: follows the low-rank FFN formulation.
+        self.fc1_b = nn.Linear(in_features, rank, bias=False)
+        self.fc1_a = nn.Linear(rank, hidden_features, bias=False)
+        self.act = act_layer()
+        self.fc2_b = nn.Linear(hidden_features, rank, bias=False)
+        self.fc2_a = nn.Linear(rank, out_features, bias=False)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x):
+        x = self.fc1_b(x)
+        x = self.fc1_a(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2_b(x)
+        x = self.fc2_a(x)
+        x = self.drop(x)
+        return x
+
+
+def build_moe_experts(in_features, hidden_features, num_experts, act_layer, drop,
+                      moe_config=None, out_features=None):
+    """Factory for MoE experts. Supports dense MLP and low-rank MLP."""
+    cfg = moe_config or {}
+    expert_type = str(cfg.get('expert_type', cfg.get('expert_impl', 'mlp'))).lower()
+
+    if expert_type in {'lr_mlp', 'low_rank_mlp', 'lowrank_mlp'}:
+        rank = int(cfg.get('lr_rank', cfg.get('rank', 32)))
+        return [
+            LR_mlp(
+                in_features=in_features,
+                hidden_features=hidden_features,
+                out_features=out_features,
+                rank=rank,
+                act_layer=act_layer,
+                drop=drop,
+            )
+            for _ in range(num_experts)
+        ]
+
+    return [
+        Mlp(
+            in_features=in_features,
+            hidden_features=hidden_features,
+            out_features=out_features,
+            act_layer=act_layer,
+            drop=drop,
+        )
+        for _ in range(num_experts)
+    ]
+
+
 def window_partition(x, window_size):
     """
     Args:
@@ -570,7 +633,14 @@ class SwinTransformerBlock(nn.Module):
             elif moe_type == 'patch':
                 _ps = moe_config.get('patch_size', 4)
                 self.moe_mlp = PatchMoEBlock(
-                    experts=[Mlp(in_features=dim, hidden_features=mlp_hidden_dim // moe_config['hid_ratio'], act_layer=act_layer, drop=drop) for _ in range(moe_config['num_experts'])],
+                    experts=build_moe_experts(
+                        in_features=dim,
+                        hidden_features=mlp_hidden_dim // moe_config['hid_ratio'],
+                        num_experts=moe_config['num_experts'],
+                        act_layer=act_layer,
+                        drop=drop,
+                        moe_config=moe_config,
+                    ),
                     hidden_dim=dim,
                     num_experts=moe_config['num_experts'],
                     capacity=moe_config['capacity'],
@@ -580,7 +650,14 @@ class SwinTransformerBlock(nn.Module):
                 )
             else:
                 self.moe_mlp = SparseMoEBlock(
-                    experts=[Mlp(in_features=dim, hidden_features=mlp_hidden_dim // moe_config['hid_ratio'], act_layer=act_layer, drop=drop) for _ in range(moe_config['num_experts'])],
+                    experts=build_moe_experts(
+                        in_features=dim,
+                        hidden_features=mlp_hidden_dim // moe_config['hid_ratio'],
+                        num_experts=moe_config['num_experts'],
+                        act_layer=act_layer,
+                        drop=drop,
+                        moe_config=moe_config,
+                    ),
                     hidden_dim=dim,
                     num_experts=moe_config['num_experts'],
                     capacity=moe_config['capacity'],

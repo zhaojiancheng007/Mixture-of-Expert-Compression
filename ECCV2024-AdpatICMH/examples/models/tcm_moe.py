@@ -39,7 +39,12 @@ import numpy as np
 import math
 
 from .utils import conv, update_registered_buffers
-from layers.moe_layers import SparseMoEBlock, ChannelMoEBlock, PatchMoEBlock, Mlp
+from layers.moe_layers import (
+    SparseMoEBlock,
+    ChannelMoEBlock,
+    PatchMoEBlock,
+    build_moe_experts,
+)
 
 
 SCALES_MIN = 0.11
@@ -167,12 +172,15 @@ class Block(nn.Module):
             elif moe_type == 'patch':
                 _ps = moe_config.get('patch_size', 4)
                 self.moe_mlp = PatchMoEBlock(
-                    experts=[
-                        Mlp(in_features=input_dim,
-                            hidden_features=mlp_hidden_dim // moe_config['hid_ratio'],
-                            out_features=output_dim)
-                        for _ in range(moe_config['num_experts'])
-                    ],
+                    experts=build_moe_experts(
+                        in_features=input_dim,
+                        hidden_features=mlp_hidden_dim // moe_config['hid_ratio'],
+                        out_features=output_dim,
+                        num_experts=moe_config['num_experts'],
+                        act_layer=nn.GELU,
+                        drop=0.0,
+                        moe_config=moe_config,
+                    ),
                     hidden_dim=input_dim,
                     num_experts=moe_config['num_experts'],
                     capacity=moe_config['capacity'],
@@ -182,12 +190,15 @@ class Block(nn.Module):
                 )
             else:
                 self.moe_mlp = SparseMoEBlock(
-                    experts=[
-                        Mlp(in_features=input_dim,
-                            hidden_features=mlp_hidden_dim // moe_config['hid_ratio'],
-                            out_features=output_dim)
-                        for _ in range(moe_config['num_experts'])
-                    ],
+                    experts=build_moe_experts(
+                        in_features=input_dim,
+                        hidden_features=mlp_hidden_dim // moe_config['hid_ratio'],
+                        out_features=output_dim,
+                        num_experts=moe_config['num_experts'],
+                        act_layer=nn.GELU,
+                        drop=0.0,
+                        moe_config=moe_config,
+                    ),
                     hidden_dim=input_dim,
                     num_experts=moe_config['num_experts'],
                     capacity=moe_config['capacity'],

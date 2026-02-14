@@ -35,7 +35,7 @@ datasets/
 *.hdf5
 *.npz
 *.npy
-
+*.png
 
 checkpoints/
 checkpoint/
